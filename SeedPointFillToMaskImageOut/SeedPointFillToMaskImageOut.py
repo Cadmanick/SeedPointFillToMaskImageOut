@@ -51,15 +51,15 @@ class FloodFillApp:
         self.fit_button = Button(self.button_frame, text="Fit to View", command=self.fit_to_view)
         self.fit_button.pack()
 
-        #self.contour_button = Button(self.button_frame, text="Show Outer Contour", command=self.find_outer_contour)
-        #self.contour_button.pack()
+        self.contour_button = Button(self.button_frame, text="Show Outer Contour", command=self.find_outer_contour)
+        self.contour_button.pack()
         
         self.pixel_slider = Scale(self.button_frame, from_=1, to=30, orient=tk.HORIZONTAL, label="Gap Pixels")
         self.pixel_slider.set(15)
         self.pixel_slider.pack()
 
-        #self.fill_gaps_button = Button(self.button_frame, text="Fill Gaps in Contour", command=self.recompute_contour_with_closing)
-        #self.fill_gaps_button.pack()
+        self.fill_gaps_button = Button(self.button_frame, text="Fill Gaps in Contour", command=self.recompute_contour_with_closing)
+        self.fill_gaps_button.pack()
 
         self.extract_button = Button(self.button_frame, text="Extract Distances", command=self.extract_text_along_decimated_lines)
         self.extract_button.pack()
@@ -172,7 +172,6 @@ class FloodFillApp:
         self.distance_regex_entry.pack(side=tk.LEFT, padx=2)
         self.distance_regex_entry.insert(0, r"\d{1,4}\.\d{1,3}\s?'")
 
-
     def autoload_pdf(self, filename):
         import os
         if os.path.exists(filename):
@@ -283,19 +282,36 @@ class FloodFillApp:
 
         # Apply mask if available
         if self.mask is not None and self.mask.size > 0:
-            # Calculate viewport region in image coordinates
             canvas_w = self.canvas.winfo_width()
             canvas_h = self.canvas.winfo_height()
             view_w = int(canvas_w / self.viewport.zoom)
             view_h = int(canvas_h / self.viewport.zoom)
 
-            x1 = int(self.viewport.offset_x)
-            y1 = int(self.viewport.offset_y)
+            x1 = int(round(self.viewport.offset_x))
+            y1 = int(round(self.viewport.offset_y))
             x2 = min(x1 + view_w, self.mask.shape[1])
             y2 = min(y1 + view_h, self.mask.shape[0])
 
+            # Ensure indices are within bounds
+            x1 = max(0, x1)
+            y1 = max(0, y1)
+            x2 = max(x1 + 1, x2)
+            y2 = max(y1 + 1, y2)
+
             # Crop mask to viewport region
             cropped_mask = self.mask[y1:y2, x1:x2]
+
+            # If cropped_mask shape doesn't match view_w/view_h, pad it
+            pad_h = view_h - cropped_mask.shape[0]
+            pad_w = view_w - cropped_mask.shape[1]
+            if pad_h > 0 or pad_w > 0:
+                cropped_mask = np.pad(
+                    cropped_mask,
+                    ((0, pad_h), (0, pad_w)),
+                    mode='constant',
+                    constant_values=0
+                )
+
             # Resize mask to canvas size
             if cropped_mask.size > 0:
                 resized_mask = cv2.resize(cropped_mask, (canvas_w, canvas_h), interpolation=cv2.INTER_NEAREST)
@@ -398,71 +414,6 @@ class FloodFillApp:
         self.mask = None            # Clear the mask
         self.outer_contour = None   # Clear the outer contour
         self.update_preview()
-        
-    def zoom(self, event):
-        MAX_ZOOM_LEVEL = 1.0  # Maximum zoom level for 1:1 pixel ratio
-        if self.original_image is None or self.viewport is None:
-            return
-
-        # Determine zoom direction
-        if hasattr(event, 'delta'):
-            # Windows scroll direction
-            factor = 1.1 if event.delta > 0 else 0.9  # Scroll forward = zoom in
-            # Linux scroll direction
-        elif event.num == 4:  # Linux scroll up
-            factor = 1.1  # Zoom in
-        elif event.num == 5:  # Linux scroll down
-            factor = 0.9  # Zoom out
-        else:
-            return
-
-        # Get mouse position on canvas
-        mouse_x, mouse_y = event.x, event.y
-
-        # Convert canvas coordinates to image coordinates
-        img_x = self.viewport.offset_x + mouse_x / self.viewport.zoom
-        img_y = self.viewport.offset_y + mouse_y / self.viewport.zoom
-
-        fit_scale = min(self.canvas_width / self.original_image.shape[1],
-                        self.canvas_height / self.original_image.shape[0])
-        new_zoom = self.viewport.zoom * factor
-        new_zoom = max(fit_scale, min(new_zoom, MAX_ZOOM_LEVEL))
-
-        # Only update if zoom changed
-        if new_zoom != self.viewport.zoom:
-            self.viewport.offset_x = img_x - mouse_x / new_zoom
-            self.viewport.offset_y = img_y - mouse_y / new_zoom
-            self.viewport.zoom = new_zoom
-            self.update_preview()
-
-    def pan(self, event):
-        if self.last_mouse_pos:
-            dx = event.x - self.last_mouse_pos[0]
-            dy = event.y - self.last_mouse_pos[1]
-
-            # Move viewport in same direction as mouse
-            self.viewport.offset_x -= dx / self.viewport.zoom
-            self.viewport.offset_y -= dy / self.viewport.zoom
-
-            # Ensure offsets stay within bounds
-            self.viewport.offset_x = max(0, min(
-                self.viewport.offset_x,
-                self.viewport.image_width - self.canvas.winfo_width() / self.viewport.zoom
-            ))
-            self.viewport.offset_y = max(0, min(
-                self.viewport.offset_y,
-                self.viewport.image_height - self.canvas.winfo_height() / self.viewport.zoom
-            ))
-
-            self.update_preview()
-
-        self.last_mouse_pos = (event.x, event.y)
-  
-    def reset_mouse_pos(self, event):
-        self.last_mouse_pos = None
-        
-    def start_pan(self, event):
-        self.last_mouse_pos = (event.x, event.y)
 
     def find_outer_contour(self):
         if self.mask is None or self.original_image is None or self.viewport is None:
@@ -516,141 +467,6 @@ class FloodFillApp:
         self.mask = new_mask[1:-1, 1:-1] * 255
         self.update_preview()
 
-    def preprocess_for_ocr(image):
-        # Convert to grayscale
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-
-        # Apply Gaussian blur to reduce noise
-        blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-
-        # Apply adaptive thresholding to enhance contrast
-        # thresh = cv2.adaptiveThreshold(
-        #     blurred, 255,
-        #     cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        #     cv2.THRESH_BINARY,
-        #     11, 2
-        # )
-        thresh = blurred
-
-        # Optional: Upscale image to improve OCR accuracy
-        upscaled = cv2.resize(thresh, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-
-        return upscaled
-
-    def extract_distances_near_contour(self):
-        if self.image is None or self.mask is None or not hasattr(self, 'outer_contour') or not self.outer_contour:
-            return
-
-        max_distance_to_contour = 200
-        outer_contour = max(self.outer_contour, key=cv2.contourArea)
-
-        # Crop image to bounding box around contour
-        x, y, w, h = cv2.boundingRect(outer_contour)
-        pad = max_distance_to_contour
-        x1 = max(x - pad, 0)
-        y1 = max(y - pad, 0)
-        x2 = min(x + w + pad, self.image.shape[1])
-        y2 = min(y + h + pad, self.image.shape[0])
-        cropped_img = self.image[y1:y2, x1:x2]
-
-        # Preprocess only the cropped region
-        preprocessed_img = FloodFillApp.preprocess_for_ocr(cropped_img)
-
-        # Prepare debug image: convert to BGR if needed
-        if len(preprocessed_img.shape) == 2:
-            debug_img = cv2.cvtColor(preprocessed_img, cv2.COLOR_GRAY2BGR)
-        else:
-            debug_img = preprocessed_img.copy()
-
-        # Transform contour coordinates to preprocessed image space
-        # Account for cropping and scaling
-        scale_x = cropped_img.shape[1] / preprocessed_img.shape[1]
-        scale_y = cropped_img.shape[0] / preprocessed_img.shape[0]
-        contour_shifted = outer_contour - [x1, y1]
-        contour_scaled = np.array(contour_shifted, dtype=np.float32)
-        contour_scaled[:, 0, 0] = contour_scaled[:, 0, 0] / scale_x
-        contour_scaled[:, 0, 1] = contour_scaled[:, 0, 1] / scale_y
-        contour_scaled = contour_scaled.astype(np.int32)
-
-        # Draw contour as thin green line
-        cv2.drawContours(debug_img, [contour_scaled], -1, (0, 255, 0), 1)
-
-        # Save debug image
-        cv2.imwrite("debug_preprocessed.png", debug_img)
-
-        # OCR only on cropped region
-        ocr_data = pytesseract.image_to_data(preprocessed_img, output_type=pytesseract.Output.DICT,
-                                             config="--psm 7 -c tessedit_char_whitelist=0123456789'\"ftin ")
-
-        scale_x = cropped_img.shape[1] / preprocessed_img.shape[1]
-        scale_y = cropped_img.shape[0] / preprocessed_img.shape[0]
-
-        highlight_img = self.image.copy()
-        inside_distances = []
-        outside_distances = []
-
-        self.ocr_candidate_boxes = []  # Reset before each extraction
-
-        # why is the only regex search happenign here?
-        for i in range(len(ocr_data['text'])):
-            text = ocr_data['text'][i].strip()
-            # Search for numbers ending in apostrophe
-            match = re.search(r"(\d+)'$", text)
-            if not match:
-                continue
-            extracted = match.group(0)  # e.g., "12'"
-
-            x_rel = ocr_data['left'][i]
-            y_rel = ocr_data['top'][i]
-            w_rel = ocr_data['width'][i]
-            h_rel = ocr_data['height'][i]
-            x_abs = x1 + int(x_rel * scale_x)
-            y_abs = y1 + int(y_rel * scale_y)
-            w_abs = int(w_rel * scale_x)
-            h_abs = int(h_rel * scale_y)
-            center = (x_abs + w_abs // 2, y_abs + h_abs // 2)
-
-            # Check if center is inside or outside the mask
-            mask_h, mask_w = self.mask.shape
-            cx, cy = int(center[0]), int(center[1])
-            is_inside_mask = (0 <= cy < mask_h) and (0 <= cx < mask_w) and (self.mask[cy, cx] > 0)
-
-            dist = cv2.pointPolygonTest(outer_contour, center, True)
-            if abs(dist) <= max_distance_to_contour:
-                cv2.rectangle(highlight_img, (x_abs, y_abs), (x_abs + w_abs, y_abs + h_abs), (0, 0, 255), 2)
-                if is_inside_mask:
-                    inside_distances.append((extracted, center, dist))
-                else:
-                    outside_distances.append((extracted, center, dist))
-
-            # Store bounding box in original image coordinates
-            self.ocr_candidate_boxes.append((x_abs, y_abs, w_abs, h_abs))
-
-        self.inside_distances = inside_distances
-        self.outside_distances = outside_distances
-
-        # Step 5: Sort distances clockwise around contour center
-        valid_distances = [(text, pt) for text, pt, _ in inside_distances + outside_distances if text.strip()]
-        sorted_distances = self.sort_clockwise(valid_distances)
-
-        # Step 6: Display distances in the table (original image coordinates)
-        self.table_text.delete("1.0", tk.END)
-        if sorted_distances:
-            for i, (text, pt) in enumerate(sorted_distances):
-                dist = next((d for t, p, d in inside_distances + outside_distances if t == text and p == pt), None)
-                location = "inside" if (text, pt, dist) in inside_distances else "outside"
-                self.table_text.insert(tk.END, f"{i+1}. {text} at {pt}, distance to contour: {dist:.2f} ({location})\n")
-        else:
-            self.table_text.insert(tk.END, "No distances found near contour.")
-
-        # Show highlights in preview
-        preview = self.viewport.get_view(highlight_img)
-        preview_rgb = cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
-        img_pil = Image.fromarray(preview_rgb)
-        self.tk_image = ImageTk.PhotoImage(img_pil)
-        self.canvas.delete("all")
-        self.canvas.create_image(0, 0, anchor=tk.NW, image=self.tk_image)
-
     def sort_clockwise(self, points):
         if not points:
             return []
@@ -663,45 +479,6 @@ class FloodFillApp:
             return np.arctan2(p[1] - cy, p[0] - cx)
 
         return sorted(points, key=lambda x: angle(x[1]))
- 
-    def fit_to_view(self):
-        if self.original_image is None or self.viewport is None:
-            return
-
-        h, w = self.original_image.shape[:2]
-        scale_x = self.canvas_width / w
-        scale_y = self.canvas_height / h
-        fit_scale = min(scale_x, scale_y)
-
-        # Set zoom level
-        self.viewport.zoom = fit_scale
-
-        # Center the image in the canvas
-        self.viewport.offset_x = (w - self.canvas_width / fit_scale) / 2
-        self.viewport.offset_y = (h - self.canvas_height / fit_scale) / 2
-
-        self.update_preview()
-        
-    def reset_zoom(self):
-        if self.viewport is None:
-            return
-
-        # Reset zoom to 1.0 and center the image
-        self.viewport.zoom = 1.0
-        self.viewport.offset_x = (self.viewport.image_width - self.canvas_width) / 2
-        self.viewport.offset_y = (self.viewport.image_height - self.canvas_height) / 2
-
-        self.update_preview()
-            
-    def on_resize(self, event):
-        self.canvas_width = event.width
-        self.canvas_height = event.height
-
-        if hasattr(self, 'viewport') and self.viewport:
-            self.viewport.canvas_width = event.width
-            self.viewport.canvas_height = event.height
-
-        self.update_preview()
 
     def trace_line(self, event):
         x_canvas, y_canvas = event.x, event.y
@@ -723,6 +500,36 @@ class FloodFillApp:
     def calculate_scale_factor(self):
         self.line_points = []
 
+        # Try to get array from extract_text_along_decimated_lines
+        contour_distances = self.extract_text_along_decimated_lines()
+        # Expected format: [(contour_number, real_distance_feet), ...]
+        pixel_lengths = []
+        real_distances_meters = []
+
+        if contour_distances:
+            # For each contour segment, get pixel length and real-world distance
+            for contour_number, real_distance_feet in contour_distances:
+                if self.decimated_contour is not None and 0 <= contour_number < len(self.decimated_contour):
+                    pt1 = self.decimated_contour[contour_number][0]
+                    pt2 = self.decimated_contour[(contour_number + 1) % len(self.decimated_contour)][0]
+                    pixel_length = math.hypot(pt2[0] - pt1[0], pt2[1] - pt1[1])
+                    pixel_lengths.append(pixel_length)
+                    real_distances_meters.append(real_distance_feet * 0.3048)
+
+            if pixel_lengths and real_distances_meters:
+                avg_pixel_length = sum(pixel_lengths) / len(pixel_lengths)
+                avg_real_distance = sum(real_distances_meters) / len(real_distances_meters)
+                if avg_real_distance > 0 and avg_pixel_length > 0:
+                    self.SCALE_FACTOR = avg_real_distance / avg_pixel_length  # meters per pixel
+                    self.PIXEL_SCALE = avg_pixel_length / avg_real_distance   # pixels per meter
+                    self.scale_factor_label.config(
+                        text=f"Scale Factor: {self.SCALE_FACTOR:.4f} meters/pixel, Pixel Scale: {self.PIXEL_SCALE:.2f} pixels/meter"
+                    )
+                    print(f"Scale factor set to {self.SCALE_FACTOR:.4f} meters/pixel")
+                    print(f"Pixel scale set to {self.PIXEL_SCALE:.2f} pixels/meter")
+                    return
+
+        # Fallback: manual input
         def on_right_click(event):
             x_canvas, y_canvas = event.x, event.y
             x_img = int(self.viewport.offset_x + x_canvas / self.viewport.zoom)
@@ -976,21 +783,12 @@ class FloodFillApp:
 
     def extract_text_along_decimated_lines(self):
         if self.image is None or self.decimated_contour is None:
-            return
+            return None
 
         img = self.image.copy()
-        highlight_img = self.image.copy()
         contour = self.decimated_contour
         line_width = 100
-        ocr_results = []
-        self.ocr_candidate_boxes = []
-
-        # Get regex patterns from entry fields
-        direction_pattern_str = self.direction_regex_entry.get()
-        distance_pattern_str = self.distance_regex_entry.get()
-
-        direction_pattern = re.compile(direction_pattern_str, re.IGNORECASE) if direction_pattern_str else None
-        distance_pattern = re.compile(distance_pattern_str) if distance_pattern_str else None
+        results = []
 
         # Use the largest contour for distance calculation
         if hasattr(self, 'outer_contour') and self.outer_contour is not None:
@@ -1044,91 +842,44 @@ class FloodFillApp:
                 if roi.size == 0 or roi.shape[0] < 5 or roi.shape[1] < 5:
                     continue
 
-                # Export ROI image
-                cv2.imwrite(f"roi_segment_{i}.png", roi)
+                # OCR: extract text from ROI
+                ocr_text = pytesseract.image_to_string(roi, config="--psm 6").strip()
 
-                # Export line overlay image
-                line_img = rotated.copy()
-                cv2.line(line_img, (int(x1r), int(y1r)), (int(x2r), int(y2r)), (0, 255, 0), 2)
-                cv2.imwrite(f"line_segment_{i}.png", line_img)
+                # Find all number strings (e.g., 12, 12.5, 12', 12.5', etc.)
+                # This regex matches numbers with optional decimal and optional apostrophe/quote
+                number_matches = re.findall(r"\d{1,4}(?:\.\d{1,3})?\s*['\"]?", ocr_text)
+                # Convert to float (ignore non-numeric)
+                distances = []
+                for match in number_matches:
+                    # Remove non-numeric characters except dot
+                    num_str = re.sub(r"[^\d.]", "", match)
+                    try:
+                        distances.append(float(num_str))
+                    except ValueError:
+                        continue
 
-                # Enhanced preprocessing
-                roi_up = FloodFillApp.preprocess_roi_for_ocr(roi)
-                
-                cv2.imwrite(f"roi_up_segment_{i}.png", roi_up)
-                # Try different Tesseract configs
-                configs = [
-                    #"--psm 7",  # Treat as a single text line
-                    "--psm 6",  # Assume a block of text
-                    #"--psm 11"  # Sparse text
-                ]
-                ocr_texts = []
-                for config in configs:
-                    ocr_texts.append(pytesseract.image_to_string(roi, config=config).strip())
-                    #roi_up_180 = cv2.rotate(roi_up, cv2.ROTATE_180)
-                    #ocr_texts.append(pytesseract.image_to_string(roi_up_180, config=config).strip())
-
-                # Only add OCR results that match either regex pattern, or all if both are blank
-                for text in ocr_texts:
-                    if not text:
-                        continue  # Skip empty OCR results
-
-                    # Accept all if both regexes are blank
-                    if not direction_pattern_str and not distance_pattern_str:
-                        include_candidate = True
-                    else:
-                        include_candidate = any([
-                            direction_pattern and direction_pattern.match(text),
-                            distance_pattern and distance_pattern.match(text)
-                        ])
-
-                    if include_candidate:
-                        self.ocr_candidate_boxes.append((cx, cy, x_max - x_min, y_max - y_min, angle))
-                        ocr_results.append((i+1, text, (pt1, pt2)))
+                distance_sum = sum(distances) if distances else 0.0
+                results.append([i, distance_sum])
 
             except Exception as e:
                 print(f"Exception on line {i}: {e}")
                 continue
 
-        # Draw rotated blue rectangles for OCR candidate boxes
-        for cx, cy, w, h, angle in self.ocr_candidate_boxes:
-            rect = ((cx, cy), (w, h), angle)
-            box = cv2.boxPoints(rect)
-            box = box.astype(int)
-            cv2.polylines(img, [box], isClosed=True, color=(255, 0, 0), thickness=2)  # Blue    
-
+        # Display results in the table at bottom right
         self.table_text.delete("1.0", tk.END)
-        if ocr_results:
-            for idx, text, (pt1, pt2) in ocr_results:
-                candidate = next(
-                    ((cx, cy, w, h, angle) for cx, cy, w, h, angle in self.ocr_candidate_boxes
-                     if abs(cx - (pt1[0] + pt2[0]) / 2.0) < 1 and abs(cy - (pt1[1] + pt2[1]) / 2.0) < 1),
-                    None
-                )
-                if candidate:
-                    cx, cy, w, h, angle = candidate
-                    self.table_text.insert(
-                        tk.END,
-                        f"Line {idx}: {text} (from {pt1} to {pt2}) | Center: ({int(cx)}, {int(cy)})\n"
-                    )
-                else:
-                    self.table_text.insert(
-                        tk.END,
-                        f"Line {idx}: {text} (from {pt1} to {pt2})\n"
-                    )
+        if results:
+            for idx, distance_sum in results:
+                self.table_text.insert(tk.END, f"Contour {idx}: Distance sum = {distance_sum:.2f}\n")
         else:
-            self.table_text.insert(tk.END, "No valid text found along decimated contour lines.")
+            self.table_text.insert(tk.END, "No distances found along decimated contour lines.\n")
 
-        # Show overlays in preview (use img, not highlight_img)
-        preview = self.viewport.get_view(img)
-        preview_rgb = cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
-        img_pil = Image.fromarray(preview_rgb)
-        self.tk_image = ImageTk.PhotoImage(img_pil)
-        self.canvas.delete("all")
-        self.canvas.create_image(0, 0, anchor=tk.NW, image=self.tk_image)
-        
+        # Append scale factor to the table
+        if self.SCALE_FACTOR is not None:
+            self.table_text.insert(tk.END, f"\nScale Factor: {self.SCALE_FACTOR:.4f} meters/pixel\n")
+        else:
+            self.table_text.insert(tk.END, "\nScale Factor: Not set\n")
 
-    
+        return results if results else None
 
 class Viewport:
     def __init__(self, image_width, image_height, canvas_width, canvas_height):
@@ -1170,6 +921,93 @@ class Viewport:
         # Resize to canvas size
         resized = cv2.resize(canvas, (self.canvas_width, self.canvas_height), interpolation=cv2.INTER_AREA)
         return resized
+            
+    def zoom(self, event):
+        MAX_ZOOM_LEVEL = 1.0  # Maximum zoom level for 1:1 pixel ratio
+        if self.original_image is None or self.viewport is None:
+            return
+
+        # Determine zoom direction
+        if hasattr(event, 'delta'):
+            # Windows scroll direction
+            factor = 1.1 if event.delta > 0 else 0.9  # Scroll forward = zoom in
+            # Linux scroll direction
+        elif event.num == 4:  # Linux scroll up
+            factor = 1.1  # Zoom in
+        elif event.num == 5:  # Linux scroll down
+            factor = 0.9  # Zoom out
+        else:
+            return
+
+        # Get mouse position on canvas
+        mouse_x, mouse_y = event.x, event.y
+
+        # Convert canvas coordinates to image coordinates
+        img_x = self.viewport.offset_x + mouse_x / self.viewport.zoom
+        img_y = self.viewport.offset_y + mouse_y / self.viewport.zoom
+
+        fit_scale = min(self.canvas_width / self.original_image.shape[1],
+                        self.canvas_height / self.original_image.shape[0])
+        new_zoom = self.viewport.zoom * factor
+        new_zoom = max(fit_scale, min(new_zoom, MAX_ZOOM_LEVEL))
+
+        # Only update if zoom changed
+        if new_zoom != self.viewport.zoom:
+            self.viewport.offset_x = img_x - mouse_x / new_zoom
+            self.viewport.offset_y = img_y - mouse_y / new_zoom
+            self.viewport.zoom = new_zoom
+            self.update_preview()
+
+    def pan(self, event):
+        if self.last_mouse_pos:
+            dx = event.x - self.last_mouse_pos[0]
+            dy = event.y - self.last_mouse_pos[1]
+
+            # Move viewport in same direction as mouse
+            self.viewport.offset_x -= dx / self.viewport.zoom
+            self.viewport.offset_y -= dy / self.viewport.zoom
+
+            # Ensure offsets stay within bounds
+            self.viewport.offset_x = max(0, min(
+                self.viewport.offset_x,
+                self.viewport.image_width - self.canvas.winfo_width() / self.viewport.zoom
+            ))
+            self.viewport.offset_y = max(0, min(
+                self.viewport.offset_y,
+                self.viewport.image_height - self.canvas.winfo_height() / self.viewport.zoom
+            ))
+
+            self.update_preview()
+
+        self.last_mouse_pos = (event.x, event.y)
+  
+    def reset_mouse_pos(self, event):
+        self.last_mouse_pos = None
+     
+    def fit_to_view(self):
+        if self.original_image is None or self.viewport is None:
+            return
+        self.viewport.fit_to_view(self.original_image)
+        self.update_preview()
+
+    def reset_zoom(self):
+        if self.viewport is None:
+            return
+        self.viewport.reset_zoom()
+        self.update_preview()
+
+    def on_resize(self, event):
+        self.canvas_width = event.width
+        self.canvas_height = event.height
+        if hasattr(self, 'viewport') and self.viewport:
+            self.viewport.on_resize(event.width, event.height)
+        self.update_preview()
+
+        
+    def start_pan(self, event):
+        self.last_mouse_pos = (event.x, event.y)
+
+
 
 
 if __name__ == "__main__":
