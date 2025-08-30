@@ -196,6 +196,14 @@ class FloodFillApp:
         else:
             print(f"File {filename} not found.")
 
+    def on_resize(self, event):
+        self.canvas_width = event.width
+        self.canvas_height = event.height
+        if hasattr(self, 'viewport') and self.viewport:
+            self.viewport.canvas_width = event.width
+            self.viewport.canvas_height = event.height
+        self.update_preview()
+
     def load_pdf(self):
         file_path = filedialog.askopenfilename(filetypes=[("PDF Files", "*.pdf")])
         if file_path:
@@ -880,48 +888,7 @@ class FloodFillApp:
             self.table_text.insert(tk.END, "\nScale Factor: Not set\n")
 
         return results if results else None
-
-class Viewport:
-    def __init__(self, image_width, image_height, canvas_width, canvas_height):
-        self.image_width = image_width
-        self.image_height = image_height
-        self.canvas_width = canvas_width
-        self.canvas_height = canvas_height
-        self.zoom = 1.0
-        self.offset_x = 0
-        self.offset_y = 0
-
-    def get_view(self, image):
-        view_w = int(self.canvas_width / self.zoom)
-        view_h = int(self.canvas_height / self.zoom)
-
-        x1 = int(self.offset_x)
-        y1 = int(self.offset_y)
-        x2 = x1 + view_w
-        y2 = y1 + view_h
-
-        # Create a blank canvas (white background)
-        canvas = np.ones((view_h, view_w, 3), dtype=np.uint8) * 255
-
-        # Compute image region to copy
-        img_x1 = max(0, x1)
-        img_y1 = max(0, y1)
-        img_x2 = min(x2, self.image_width)
-        img_y2 = min(y2, self.image_height)
-
-        # Compute where to paste it on the canvas
-        paste_x1 = max(0, -x1)
-        paste_y1 = max(0, -y1)
-        paste_x2 = paste_x1 + (img_x2 - img_x1)
-        paste_y2 = paste_y1 + (img_y2 - img_y1)
-
-        # Copy image region into canvas
-        canvas[paste_y1:paste_y2, paste_x1:paste_x2] = image[img_y1:img_y2, img_x1:img_x2]
-
-        # Resize to canvas size
-        resized = cv2.resize(canvas, (self.canvas_width, self.canvas_height), interpolation=cv2.INTER_AREA)
-        return resized
-            
+        
     def zoom(self, event):
         MAX_ZOOM_LEVEL = 1.0  # Maximum zoom level for 1:1 pixel ratio
         if self.original_image is None or self.viewport is None:
@@ -983,31 +950,71 @@ class Viewport:
   
     def reset_mouse_pos(self, event):
         self.last_mouse_pos = None
-     
+    
+    def start_pan(self, event):
+        self.last_mouse_pos = (event.x, event.y)
+    
     def fit_to_view(self):
         if self.original_image is None or self.viewport is None:
             return
-        self.viewport.fit_to_view(self.original_image)
+        h, w = self.original_image.shape[:2]
+        scale_x = self.canvas_width / w
+        scale_y = self.canvas_height / h
+        fit_scale = min(scale_x, scale_y)
+        self.viewport.zoom = fit_scale
+        self.viewport.offset_x = (w - self.canvas_width / fit_scale) / 2
+        self.viewport.offset_y = (h - self.canvas_height / fit_scale) / 2
         self.update_preview()
 
     def reset_zoom(self):
         if self.viewport is None:
             return
-        self.viewport.reset_zoom()
+        self.viewport.zoom = 1.0
+        self.viewport.offset_x = (self.viewport.image_width - self.canvas_width) / 2
+        self.viewport.offset_y = (self.viewport.image_height - self.canvas_height) / 2
         self.update_preview()
+ 
 
-    def on_resize(self, event):
-        self.canvas_width = event.width
-        self.canvas_height = event.height
-        if hasattr(self, 'viewport') and self.viewport:
-            self.viewport.on_resize(event.width, event.height)
-        self.update_preview()
+class Viewport:
+    def __init__(self, image_width, image_height, canvas_width, canvas_height):
+        self.image_width = image_width
+        self.image_height = image_height
+        self.canvas_width = canvas_width
+        self.canvas_height = canvas_height
+        self.zoom = 1.0
+        self.offset_x = 0
+        self.offset_y = 0
 
-        
-    def start_pan(self, event):
-        self.last_mouse_pos = (event.x, event.y)
+    def get_view(self, image):
+        view_w = int(self.canvas_width / self.zoom)
+        view_h = int(self.canvas_height / self.zoom)
 
+        x1 = int(self.offset_x)
+        y1 = int(self.offset_y)
+        x2 = x1 + view_w
+        y2 = y1 + view_h
 
+        # Create a blank canvas (white background)
+        canvas = np.ones((view_h, view_w, 3), dtype=np.uint8) * 255
+
+        # Compute image region to copy
+        img_x1 = max(0, x1)
+        img_y1 = max(0, y1)
+        img_x2 = min(x2, self.image_width)
+        img_y2 = min(y2, self.image_height)
+
+        # Compute where to paste it on the canvas
+        paste_x1 = max(0, -x1)
+        paste_y1 = max(0, -y1)
+        paste_x2 = paste_x1 + (img_x2 - img_x1)
+        paste_y2 = paste_y1 + (img_y2 - img_y1)
+
+        # Copy image region into canvas
+        canvas[paste_y1:paste_y2, paste_x1:paste_x2] = image[img_y1:img_y2, img_x1:img_x2]
+
+        # Resize to canvas size
+        resized = cv2.resize(canvas, (self.canvas_width, self.canvas_height), interpolation=cv2.INTER_AREA)
+        return resized
 
 
 if __name__ == "__main__":
