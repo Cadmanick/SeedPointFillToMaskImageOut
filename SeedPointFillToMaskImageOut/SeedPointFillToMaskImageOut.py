@@ -51,15 +51,15 @@ class FloodFillApp:
         self.fit_button = Button(self.button_frame, text="Fit to View", command=self.fit_to_view)
         self.fit_button.pack()
 
-        self.contour_button = Button(self.button_frame, text="Show Outer Contour", command=self.find_outer_contour)
-        self.contour_button.pack()
+        # self.contour_button = Button(self.button_frame, text="Show Outer Contour", command=self.find_outer_contour)
+        # self.contour_button.pack()
         
         self.pixel_slider = Scale(self.button_frame, from_=1, to=30, orient=tk.HORIZONTAL, label="Gap Pixels")
         self.pixel_slider.set(15)
         self.pixel_slider.pack()
 
-        self.fill_gaps_button = Button(self.button_frame, text="Fill Gaps in Contour", command=self.recompute_contour_with_closing)
-        self.fill_gaps_button.pack()
+        # self.fill_gaps_button = Button(self.button_frame, text="Fill Gaps in Contour", command=self.recompute_contour_with_closing)
+        # self.fill_gaps_button.pack()
 
         self.extract_button = Button(self.button_frame, text="Extract Distances", command=self.extract_text_along_decimated_lines)
         self.extract_button.pack()
@@ -125,6 +125,9 @@ class FloodFillApp:
         self.coord_label = Label(self.table_frame, text="Mouse: (x, y)", font=("Arial", 10), fg="black")
         self.coord_label.pack(side=tk.BOTTOM, anchor=tk.SE, padx=10, pady=2)
 
+        self.distance_label = Label(self.table_frame, text="Measured Distance: N/A", font=("Arial", 10), fg="green")
+        self.distance_label.pack(side=tk.BOTTOM, anchor=tk.SE, padx=10, pady=2)
+
         # Canvas interaction variables
         self.image = None
         self.tk_image = None
@@ -158,19 +161,26 @@ class FloodFillApp:
         # Ensure preview updates when slider moves
         self.aggressiveness_slider.config(command=lambda v: self.update_preview())
 
-        # Add regex pattern fields for OCR candidate extraction
-        self.regex_frame = tk.Frame(self.button_frame)
-        self.regex_frame.pack(pady=5)
+        self.measure_button = Button(
+            self.button_frame,
+            text="Measure Distance",
+            command=self.enable_measure_mode
+        )
+        self.measure_button.pack()
 
-        tk.Label(self.regex_frame, text="Direction Regex:").pack(side=tk.LEFT)
-        self.direction_regex_entry = Entry(self.regex_frame, width=20)
-        self.direction_regex_entry.pack(side=tk.LEFT, padx=2)
-        #self.direction_regex_entry.insert(0, r"^[NS].*[WE]$")
+        # # Add regex pattern fields for OCR candidate extraction
+        # self.regex_frame = tk.Frame(self.button_frame)
+        # self.regex_frame.pack(pady=5)
 
-        tk.Label(self.regex_frame, text="Distance Regex:").pack(side=tk.LEFT)
-        self.distance_regex_entry = Entry(self.regex_frame, width=20)
-        self.distance_regex_entry.pack(side=tk.LEFT, padx=2)
-        self.distance_regex_entry.insert(0, r"\d{1,4}\.\d{1,3}\s?'")
+        # tk.Label(self.regex_frame, text="Direction Regex:").pack(side=tk.LEFT)
+        # self.direction_regex_entry = Entry(self.regex_frame, width=20)
+        # self.direction_regex_entry.pack(side=tk.LEFT, padx=2)
+        # #self.direction_regex_entry.insert(0, r"^[NS].*[WE]$")
+
+        # tk.Label(self.regex_frame, text="Distance Regex:").pack(side=tk.LEFT)
+        # self.distance_regex_entry = Entry(self.regex_frame, width=20)
+        # self.distance_regex_entry.pack(side=tk.LEFT, padx=2)
+        # self.distance_regex_entry.insert(0, r"\d{1,4}\.\d{1,3}\s?'")
 
     def autoload_pdf(self, filename):
         import os
@@ -510,6 +520,7 @@ class FloodFillApp:
 
         # Try to get array from extract_text_along_decimated_lines
         contour_distances = self.extract_text_along_decimated_lines()
+        print("contour_distances:", contour_distances)
         # Expected format: [(contour_number, real_distance_feet), ...]
         pixel_lengths = []
         real_distances_meters = []
@@ -517,16 +528,21 @@ class FloodFillApp:
         if contour_distances:
             # For each contour segment, get pixel length and real-world distance
             for contour_number, real_distance_feet in contour_distances:
-                if self.decimated_contour is not None and 0 <= contour_number < len(self.decimated_contour):
-                    pt1 = self.decimated_contour[contour_number][0]
-                    pt2 = self.decimated_contour[(contour_number + 1) % len(self.decimated_contour)][0]
-                    pixel_length = math.hypot(pt2[0] - pt1[0], pt2[1] - pt1[1])
-                    pixel_lengths.append(pixel_length)
-                    real_distances_meters.append(real_distance_feet * 0.3048)
+                print(f"Contour {contour_number}: OCR feet={real_distance_feet}")
+                pt1 = self.decimated_contour[contour_number][0]
+                pt2 = self.decimated_contour[(contour_number + 1) % len(self.decimated_contour)][0]
+                pixel_length = math.hypot(pt2[0] - pt1[0], pt2[1] - pt1[1])
+                print(f"Pixel length: {pixel_length}")
+                print(f"Real distance (meters): {real_distance_feet * 0.3048}")
+                pixel_lengths.append(pixel_length)
+                real_distances_meters.append(real_distance_feet * 0.3048)
 
-            if pixel_lengths and real_distances_meters:
-                avg_pixel_length = sum(pixel_lengths) / len(pixel_lengths)
-                avg_real_distance = sum(real_distances_meters) / len(real_distances_meters)
+            # Simple average: only use valid (nonzero) segments
+            valid_pairs = [(pl, rd) for pl, rd in zip(pixel_lengths, real_distances_meters) if rd > 0]
+            if valid_pairs:
+                pixel_lengths_valid, real_distances_valid = zip(*valid_pairs)
+                avg_pixel_length = sum(pixel_lengths_valid) / len(pixel_lengths_valid)
+                avg_real_distance = sum(real_distances_valid) / len(real_distances_valid)
                 if avg_real_distance > 0 and avg_pixel_length > 0:
                     self.SCALE_FACTOR = avg_real_distance / avg_pixel_length  # meters per pixel
                     self.PIXEL_SCALE = avg_pixel_length / avg_real_distance   # pixels per meter
@@ -850,23 +866,39 @@ class FloodFillApp:
                 if roi.size == 0 or roi.shape[0] < 5 or roi.shape[1] < 5:
                     continue
 
-                # OCR: extract text from ROI
+                # OCR: extract text from ROI (normal)
                 ocr_text = pytesseract.image_to_string(roi, config="--psm 6").strip()
+                # OCR: extract text from ROI (inverted)
+                roi_inverted = cv2.rotate(roi, cv2.ROTATE_180)
+                ocr_text_inverted = pytesseract.image_to_string(roi_inverted, config="--psm 6").strip()
 
-                # Find all number strings (e.g., 12, 12.5, 12', 12.5', etc.)
-                # This regex matches numbers with optional decimal and optional apostrophe/quote
-                number_matches = re.findall(r"\d{1,4}(?:\.\d{1,3})?\s*['\"]?", ocr_text)
+                print("Normal OCR:", ocr_text)
+                print("Inverted OCR:", ocr_text_inverted)
+
+                # Combine results
+                all_texts = [ocr_text, ocr_text_inverted]
+                number_matches = []
+                for text in all_texts:
+                    number_matches += re.findall(r"\d{1,4}(?:\.\d{1,3})?\s*['\"]?", text)
+                print(number_matches)
                 # Convert to float (ignore non-numeric)
                 distances = []
                 for match in number_matches:
                     # Remove non-numeric characters except dot
                     num_str = re.sub(r"[^\d.]", "", match)
-                    try:
-                        distances.append(float(num_str))
-                    except ValueError:
-                        continue
+                    print(num_str)
+                   
+                    if '.' in num_str:
+                        try:
+                            distances.append(float(num_str))
+                        except ValueError:
+                            continue
+                    else:
+                        pass
 
                 distance_sum = sum(distances) if distances else 0.0
+                print(".")
+                print(distance_sum)
                 results.append([i, distance_sum])
 
             except Exception as e:
@@ -954,6 +986,45 @@ class FloodFillApp:
     def start_pan(self, event):
         self.last_mouse_pos = (event.x, event.y)
     
+    def start_measure(self, event):
+        # Get image coordinates from canvas coordinates
+        x_canvas, y_canvas = event.x, event.y
+        x_img = int(self.viewport.offset_x + x_canvas / self.viewport.zoom)
+        y_img = int(self.viewport.offset_y + y_canvas / self.viewport.zoom)
+
+        if not hasattr(self, 'measure_points'):
+            self.measure_points = []
+        self.measure_points.append((x_img, y_img))
+        self.canvas.create_oval(event.x-3, event.y-3, event.x+3, event.y+3, fill="magenta")
+
+        if len(self.measure_points) == 2:
+            x1, y1 = self.measure_points[0]
+            x2, y2 = self.measure_points[1]
+            # Draw line
+            canvas_x1 = int((x1 - self.viewport.offset_x) * self.viewport.zoom)
+            canvas_y1 = int((y1 - self.viewport.offset_y) * self.viewport.zoom)
+            canvas_x2 = int((x2 - self.viewport.offset_x) * self.viewport.zoom)
+            canvas_y2 = int((y2 - self.viewport.offset_y) * self.viewport.zoom)
+            self.canvas.create_line(canvas_x1, canvas_y1, canvas_x2, canvas_y2, fill="magenta", width=2)
+
+            # Calculate pixel distance
+            pixel_distance = math.hypot(x2 - x1, y2 - y1)
+            # Convert to scaled units if scale factor is set
+            if self.SCALE_FACTOR:
+                scaled_distance = pixel_distance * self.SCALE_FACTOR
+                self.distance_label.config(
+                    text=f"Measured Distance: {pixel_distance:.2f} px, {scaled_distance:.2f} meters",
+                    fg="green"
+                )
+            else:
+                self.distance_label.config(
+                    text=f"Measured Distance: {pixel_distance:.2f} px",
+                    fg="green"
+                )
+
+            # Reset for next measurement
+            self.measure_points = []
+
     def fit_to_view(self):
         if self.original_image is None or self.viewport is None:
             return
@@ -973,6 +1044,13 @@ class FloodFillApp:
         self.viewport.offset_x = (self.viewport.image_width - self.canvas_width) / 2
         self.viewport.offset_y = (self.viewport.image_height - self.canvas_height) / 2
         self.update_preview()
+
+    def enable_measure_mode(self):
+        # Unbind previous right-click actions if any
+        self.canvas.unbind("<Button-3>")
+        # Bind right-click to start_measure
+        self.canvas.bind("<Button-3>", self.start_measure)
+        self.distance_label.config(text="Measured Distance: N/A")
  
 
 class Viewport:
