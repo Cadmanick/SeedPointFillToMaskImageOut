@@ -4,13 +4,14 @@
     <SchemaVersion>2.0</SchemaVersion>
     <ProjectGuid>124c00cb-fb0b-4f47-b982-bd302903dc3b</ProjectGuid>
     <ProjectHome>.</ProjectHome>
-    <StartupFile>SeedPointFillToMaskImageOut.py</StartupFile>
+    <StartupFile>SeedPointFillToMaskImageOut_qt.py</StartupFile>
     <SearchPath>
     </SearchPath>
     <WorkingDirectory>.</WorkingDirectory>
     <OutputPath>.</OutputPath>
     <Name>SeedPointFillToMaskImageOut</Name>
     <RootNamespace>SeedPointFillToMaskImageOut</RootNamespace>
+    <IsWindowsApplication>False</IsWindowsApplication>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)' == 'Debug' ">
     <DebugSymbols>true</DebugSymbols>

@@ -101,6 +101,10 @@ class FloodFillApp(QMainWindow):
         self.kernel_slider = self._make_slider("Kernel Size", 5, 100, 5)
         slider_layout.addWidget(self.kernel_slider['widget'])
 
+        # --- Lambda slider for image blending ---
+        self.lambda_slider = self._make_slider("Lambda", 0, 100, 0, self.update_preview)
+        slider_layout.addWidget(self.lambda_slider['widget'])
+
         # --- Canvas below sliders ---
         self.canvas = CanvasWidget()
         main_layout.addWidget(self.canvas)
@@ -125,13 +129,17 @@ class FloodFillApp(QMainWindow):
         self.extract_button.clicked.connect(self.extract_text_along_decimated_lines)
         button_layout.addWidget(self.extract_button)
 
-        self.export_geotiff_button = QPushButton("Export GeoTIFF")
-        self.export_geotiff_button.clicked.connect(self.export_geotiff)
-        button_layout.addWidget(self.export_geotiff_button)
-
         self.measure_button = QPushButton("Measure Distance")
         self.measure_button.clicked.connect(self.enable_measure_mode)
         button_layout.addWidget(self.measure_button)
+
+        self.simplify_contour_button = QPushButton("Create Simplified Contour")
+        self.simplify_contour_button.clicked.connect(self.create_simplified_contour)
+        button_layout.addWidget(self.simplify_contour_button)
+
+        self.export_geotiff_button = QPushButton("Export GeoTIFF")
+        self.export_geotiff_button.clicked.connect(self.export_geotiff)
+        button_layout.addWidget(self.export_geotiff_button)
 
         # --- Bottom: Table, scale input, scale factor label ---
         bottom_layout = QHBoxLayout()
@@ -218,12 +226,28 @@ class FloodFillApp(QMainWindow):
         # Get aggressiveness value from slider
         threshold_value = self.aggressiveness_slider['slider'].value()
 
-        # Convert to grayscale
+        # 1. Convert to grayscale
         gray = cv2.cvtColor(self.image, cv2.COLOR_BGR2GRAY)
-        # Apply threshold using aggressiveness value
-        _, thresh = cv2.threshold(gray, threshold_value, 255, cv2.THRESH_BINARY)
-        # Find all contours (not just external)
-        contours, _ = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+
+        # 2. Contrast enhancement (CLAHE)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        enhanced = clahe.apply(gray)
+
+        # 3. Denoise (Gaussian blur)
+        blurred = cv2.GaussianBlur(enhanced, (5, 5), 0)
+
+        # 4. Edge enhancement (adaptive threshold)
+        thresh = cv2.adaptiveThreshold(
+            blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY, 11, 2
+        )
+
+        # 5. Morphological closing to fill small gaps
+        kernel = np.ones((3, 3), np.uint8)
+        closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+
+        # 6. Find all contours with high accuracy (no simplification)
+        contours, _ = cv2.findContours(closed, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
 
         # Draw contours on a copy for visualization (optional)
         contour_img = self.original_image.copy()
@@ -412,7 +436,7 @@ class FloodFillApp(QMainWindow):
             return
 
         img_h, img_w = self.image.shape[:2]
-        canvas_w, canvas_h = self.canvas.width(), self.canvas.height()
+        canvas_w, canvas_h = self.canvas.width(), self.canvas.height();
 
         # Calculate scale to fit image inside canvas
         scale_x = canvas_w / img_w
@@ -446,11 +470,86 @@ class FloodFillApp(QMainWindow):
         pass
 
     def update_preview(self):
-        # Port your logic from Tkinter's update_preview here
-        pass
+        if self.original_image is None:
+            return
+
+        # Get contrast value from slider (0-200, default 100)
+        contrast_value = self.contrast_slider['slider'].value()
+        alpha = contrast_value / 100.0  # 1.0 = original, <1.0 = less, >1.0 = more
+
+        # Convert to grayscale for line detection
+        gray = cv2.cvtColor(self.original_image, cv2.COLOR_BGR2GRAY)
+
+        # Detect lines using adaptive threshold (binary image: lines are white)
+        lines_mask = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 11, 2
+        )
+
+        # Create a 3-channel mask for color image
+        lines_mask_color = cv2.cvtColor(lines_mask, cv2.COLOR_GRAY2BGR)
+
+        # Enhance only the lines: increase their contrast
+        enhanced_lines = cv2.convertScaleAbs(self.original_image, alpha=alpha, beta=0)
+
+        # Where lines_mask is white, use enhanced_lines; else use original
+        result = np.where(lines_mask_color == 255, enhanced_lines, self.original_image)
+
+        # Continue with flood fill preview as before
+        aggressiveness = self.aggressiveness_slider['slider'].value()
+        if self.seed_points:
+            seed_point = self.seed_points[0]
+        else:
+            h, w = result.shape[:2]
+            seed_point = (w // 2, h // 2)
+
+        h, w = result.shape[:2]
+        mask = np.zeros((h + 2, w + 2), np.uint8)
+        flood_img = result.copy()
+        cv2.floodFill(
+            flood_img, mask, seed_point, (0, 0, 255),
+            (aggressiveness,) * 3, (aggressiveness,) * 3,
+            flags=cv2.FLOODFILL_MASK_ONLY | cv2.FLOODFILL_FIXED_RANGE
+        )
+        mask = mask[1:-1, 1:-1]
+        overlay = result.copy()
+        overlay[mask != 0] = [0, 0, 255]  # Red
+        preview = cv2.addWeighted(result, 0.7, overlay, 0.3, 0)
+
+        self.image = preview
+        self.update_canvas_image()
 
     def update_aggressiveness_value_label(self, v):
         self.aggressiveness_slider['value_label'].setText(str(int(float(v))))
+
+    def create_simplified_contour(self):
+        if self.mask is None or np.count_nonzero(self.mask) == 0:
+            # No mask available
+            return
+
+        # Find contours in the mask
+        mask_for_contours = self.mask.copy()
+        if mask_for_contours.max() > 1:
+            mask_for_contours = (mask_for_contours > 0).astype(np.uint8) * 255
+        contours, _ = cv2.findContours(mask_for_contours, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        if not contours:
+            return
+
+        # Use the largest contour
+        largest_contour = max(contours, key=cv2.contourArea)
+
+        # Get epsilon from the slider (fraction of arc length)
+        epsilon = self.simplify_slider['slider'].value() * cv2.arcLength(largest_contour, True)
+        simplified = cv2.approxPolyDP(largest_contour, epsilon, True)
+
+        # Store for further use if needed
+        self.decimated_contour = simplified
+
+        # Draw the simplified contour on a copy of the original image
+        contour_img = self.original_image.copy()
+        cv2.drawContours(contour_img, [simplified], -1, (255, 0, 255), 2)  # Magenta for visibility
+
+        self.image = contour_img
+        self.update_canvas_image()        
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
