@@ -8,6 +8,7 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QPoint
 from PyQt5.QtGui import QPixmap, QImage, QColor, QCursor
+import os
 
 class CanvasWidget(QLabel):
     left_click = pyqtSignal(int, int)
@@ -88,20 +89,24 @@ class FloodFillApp(QMainWindow):
 
         self.aggressiveness_slider = self._make_slider("Aggressiveness", 0, 255, 70, self.update_preview)
         slider_layout.addWidget(self.aggressiveness_slider['widget'])
+        slider_layout.addSpacing(20)
 
         self.pixel_slider = self._make_slider("Gap Pixels", 1, 30, 15)
         slider_layout.addWidget(self.pixel_slider['widget'])
+        slider_layout.addSpacing(20)
 
-        self.simplify_slider = self._make_slider("Simplify Contour", .001, .01, .001)
+        self.simplify_slider = self._make_slider("Simplify Contour", 1, 100, 5, self.create_simplified_contour)
         slider_layout.addWidget(self.simplify_slider['widget'])
+        slider_layout.addSpacing(20)
 
         self.contrast_slider = self._make_slider("Contrast", 0, 200, 100, self.update_preview)
         slider_layout.addWidget(self.contrast_slider['widget'])
+        slider_layout.addSpacing(20)
 
-        self.kernel_slider = self._make_slider("Kernel Size", 5, 100, 5)
+        self.kernel_slider = self._make_slider("Kernel Size", 5, 100, 5, self.create_simplified_contour)
         slider_layout.addWidget(self.kernel_slider['widget'])
+        slider_layout.addSpacing(20)
 
-        # --- Lambda slider for image blending ---
         self.lambda_slider = self._make_slider("Lambda", 0, 100, 0, self.update_preview)
         slider_layout.addWidget(self.lambda_slider['widget'])
 
@@ -140,6 +145,11 @@ class FloodFillApp(QMainWindow):
         self.export_geotiff_button = QPushButton("Export GeoTIFF")
         self.export_geotiff_button.clicked.connect(self.export_geotiff)
         button_layout.addWidget(self.export_geotiff_button)
+
+        # --- Add OCR button ---
+        self.ocr_button = QPushButton("OCR Along Contour")
+        self.ocr_button.clicked.connect(self.ocr_along_contour)
+        button_layout.addWidget(self.ocr_button)
 
         # --- Bottom: Table, scale input, scale factor label ---
         bottom_layout = QHBoxLayout()
@@ -222,43 +232,9 @@ class FloodFillApp(QMainWindow):
     def add_seed_point(self, x, y):
         if self.image is None:
             return
-
-        # Get aggressiveness value from slider
-        threshold_value = self.aggressiveness_slider['slider'].value()
-
-        # 1. Convert to grayscale
-        gray = cv2.cvtColor(self.image, cv2.COLOR_BGR2GRAY)
-
-        # 2. Contrast enhancement (CLAHE)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-        enhanced = clahe.apply(gray)
-
-        # 3. Denoise (Gaussian blur)
-        blurred = cv2.GaussianBlur(enhanced, (5, 5), 0)
-
-        # 4. Edge enhancement (adaptive threshold)
-        thresh = cv2.adaptiveThreshold(
-            blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY, 11, 2
-        )
-
-        # 5. Morphological closing to fill small gaps
-        kernel = np.ones((3, 3), np.uint8)
-        closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
-
-        # 6. Find all contours with high accuracy (no simplification)
-        contours, _ = cv2.findContours(closed, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
-
-        # Draw contours on a copy for visualization (optional)
-        contour_img = self.original_image.copy()
-        cv2.drawContours(contour_img, contours, -1, (0, 255, 0), 2)
-
-        # Update the displayed image to show contours
-        self.image = contour_img
-        self.update_canvas_image()
-
-        # Optionally, store contours for further processing
-        self.found_contours = contours
+        img_x, img_y = self.canvas_to_image_coords(x, y)
+        self.seed_points = [(img_x, img_y)]
+        self.flood_fill_and_show_mask_contours()
 
     def trace_line(self, x, y):
         # Port your logic from Tkinter's trace_line here
@@ -283,7 +259,7 @@ class FloodFillApp(QMainWindow):
         flood_img = self.image.copy()
         h, w = flood_img.shape[:2]
         mask = np.zeros((h + 2, w + 2), np.uint8)
-        aggressiveness = self.aggressiveness_slider.get()
+        aggressiveness = self.aggressiveness_slider['slider'].value()
 
         for point in self.seed_points:
             cv2.floodFill(
@@ -295,15 +271,47 @@ class FloodFillApp(QMainWindow):
         # Remove border and scale mask for display
         mask = mask[1:-1, 1:-1]
 
-        # Use kernel size from slider for morphological closing
-        kernel_size = self.kernel_slider.get()
-        if kernel_size > 1:
-            kernel = np.ones((kernel_size, kernel_size), np.uint8)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
         if np.count_nonzero(mask) == 0:
             print("Flood fill did not mark any mask pixels. Try adjusting aggressiveness or seed point.")
         self.mask = mask * 255
+
+    def flood_fill_and_show_mask_contours(self):
+        if self.image is None or not self.seed_points:
+            print("No image or seed point.")
+            return
+
+        # 1. Flood fill to create mask
+        flood_img = self.image.copy()
+        h, w = flood_img.shape[:2]
+        mask = np.zeros((h + 2, w + 2), np.uint8)
+        aggressiveness = self.aggressiveness_slider['slider'].value()
+
+        for point in self.seed_points:
+            cv2.floodFill(
+                flood_img, mask, point, (255, 255, 255),
+                (aggressiveness,) * 3, (aggressiveness,) * 3,
+                flags=cv2.FLOODFILL_MASK_ONLY | cv2.FLOODFILL_FIXED_RANGE
+            )
+
+        mask = mask[1:-1, 1:-1]
+        if np.count_nonzero(mask) == 0:
+            print("Flood fill did not mark any mask pixels. Try adjusting aggressiveness or seed point.")
+            return
+
+        self.mask = mask * 255
+
+        # 2. Overlay mask on original image
+        overlay = self.original_image.copy()
+        overlay[self.mask > 0] = [0, 0, 255]  # Red overlay for mask
+        blended = cv2.addWeighted(self.original_image, 0.7, overlay, 0.3, 0)
+
+        # 3. Find contours in the mask and draw them on the overlay
+        mask_for_contours = (self.mask > 0).astype(np.uint8) * 255
+        contours, _ = cv2.findContours(mask_for_contours, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(blended, contours, -1, (0, 255, 0), 2)  # Green contours
+
+        self.image = blended
+        self.update_canvas_image()
 
     def zoom(self, delta):
         if self.image is None:
@@ -523,33 +531,225 @@ class FloodFillApp(QMainWindow):
 
     def create_simplified_contour(self):
         if self.mask is None or np.count_nonzero(self.mask) == 0:
-            # No mask available
             return
 
-        # Find contours in the mask
-        mask_for_contours = self.mask.copy()
+        # Apply morphological closing/opening with kernel size from slider
+        kernel_size = self.kernel_slider['slider'].value()
+        if kernel_size > 1:
+            kernel = np.ones((kernel_size, kernel_size), np.uint8)
+            mask_for_contours = cv2.morphologyEx(self.mask, cv2.MORPH_CLOSE, kernel)
+        else:
+            mask_for_contours = self.mask.copy()
+
         if mask_for_contours.max() > 1:
             mask_for_contours = (mask_for_contours > 0).astype(np.uint8) * 255
-        contours, _ = cv2.findContours(mask_for_contours, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        contours, _ = cv2.findContours(mask_for_contours, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
         if not contours:
             return
 
-        # Use the largest contour
         largest_contour = max(contours, key=cv2.contourArea)
-
-        # Get epsilon from the slider (fraction of arc length)
-        epsilon = self.simplify_slider['slider'].value() * cv2.arcLength(largest_contour, True)
+        slider_value = self.simplify_slider['slider'].value()  # 1-100
+        epsilon = (slider_value / 1000.0) * cv2.arcLength(largest_contour, True)  # 0.001–0.1 * arcLength
         simplified = cv2.approxPolyDP(largest_contour, epsilon, True)
 
-        # Store for further use if needed
+        print(f"Original points: {len(largest_contour)}, Simplified: {len(simplified)}, Epsilon: {epsilon:.4f}, Kernel: {kernel_size}")
+
         self.decimated_contour = simplified
 
-        # Draw the simplified contour on a copy of the original image
         contour_img = self.original_image.copy()
-        cv2.drawContours(contour_img, [simplified], -1, (255, 0, 255), 2)  # Magenta for visibility
+        cv2.drawContours(contour_img, [simplified], -1, (255, 0, 255), 2)
+        self.image = contour_img
+        self.update_canvas_image()        
+
+    def show_mask_contours(self):
+        if self.mask is None or np.count_nonzero(self.mask) == 0:
+            print("No mask available.")
+            return
+
+        # Ensure mask is binary
+        mask_for_contours = (self.mask > 0).astype(np.uint8) * 255
+
+        # Find contours in the mask only
+        contours, _ = cv2.findContours(mask_for_contours, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            print("No contours found in mask.")
+            return
+
+        # Draw contours on a copy of the original image
+        contour_img = self.original_image.copy()
+        cv2.drawContours(contour_img, contours, -1, (0, 255, 0), 2)  # Green contours
 
         self.image = contour_img
         self.update_canvas_image()        
+
+    def show_outer_contour(self):
+        if self.mask is None or np.count_nonzero(self.mask) == 0:
+            print("No mask available.")
+            return
+
+        # Ensure mask is binary
+        mask_for_contours = (self.mask > 0).astype(np.uint8) * 255
+
+        # Find only the outermost contours
+        contours, _ = cv2.findContours(mask_for_contours, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            print("No contours found in mask.")
+            return
+
+        # Use the largest contour as the outer contour
+        outer_contour = max(contours, key=cv2.contourArea)
+
+        # Draw the outer contour on a copy of the original image
+        contour_img = self.original_image.copy()
+        cv2.drawContours(contour_img, [outer_contour], -1, (0, 255, 255), 2)  # Yellow for visibility
+
+        self.image = contour_img
+        self.update_canvas_image()        
+
+    def show_first_closed_contour_outside_seed(self):
+        if self.mask is None or np.count_nonzero(self.mask) == 0 or not self.seed_points:
+            print("No mask or seed point available.")
+            return
+
+        # Use the first seed point
+        seed_x, seed_y = self.seed_points[0]
+
+        # Ensure mask is binary
+        mask_for_contours = (self.mask > 0).astype(np.uint8) * 255
+
+        # Find only the outermost contours
+        contours, _ = cv2.findContours(mask_for_contours, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            print("No contours found in mask.")
+            return
+
+        # Find the first closed contour outside the seed point (pointPolygonTest < 0)
+        min_abs_dist = float('inf')
+        outside_contour = None
+        for cnt in contours:
+            dist = cv2.pointPolygonTest(cnt, (float(seed_x), float(seed_y)), True)
+            if dist < 0:  # Seed is outside this contour
+                abs_dist = abs(dist)
+                if abs_dist < min_abs_dist:
+                    min_abs_dist = abs_dist
+                    outside_contour = cnt
+
+        if outside_contour is None:
+            print("No closed contour found outside the seed point.")
+            return
+
+        # Draw only this contour
+        contour_img = self.original_image.copy()
+        cv2.drawContours(contour_img, [outside_contour], -1, (255, 0, 0), 2)  # Blue for visibility
+
+        self.image = contour_img
+        self.update_canvas_image()
+
+    def canvas_to_image_coords(self, x, y):
+        """Convert canvas (widget) coordinates to image coordinates, considering pan and zoom."""
+        canvas_w, canvas_h = self.canvas.width(), self.canvas.height()
+        img_h, img_w = self.original_image.shape[:2]
+        scale = self.zoom_level
+        new_w = int(img_w * scale)
+        new_h = int(img_h * scale)
+        # Calculate top-left of image in canvas
+        img_x0 = (canvas_w - new_w) // 2 + self.pan_x
+        img_y0 = (canvas_h - new_h) // 2 + self.pan_y
+        # Convert canvas to image coordinates
+        img_x = int((x - img_x0) / scale)
+        img_y = int((y - img_y0) / scale)
+        # Clamp to image bounds
+        img_x = np.clip(img_x, 0, img_w - 1)
+        img_y = np.clip(img_y, 0, img_h - 1)
+        return img_x, img_y
+
+    def ocr_along_contour(self):
+        try:
+            import pytesseract
+        except ImportError:
+            print("pytesseract is not installed. Install with: pip install pytesseract")
+            return
+
+        if self.decimated_contour is None or len(self.decimated_contour) < 2:
+            print("No simplified contour available.")
+            return
+
+        img = self.original_image.copy()
+        contour = self.decimated_contour.reshape(-1, 2)
+        patch_length = 150  # Length of the patch along the segment
+        patch_width = 100    # Width of the patch perpendicular to the segment
+
+        # Create output directory for ROI segments
+        output_dir = "roi_segments"
+        os.makedirs(output_dir, exist_ok=True)
+
+        # For highlighting
+        highlight_img = img.copy()
+
+        num_samples_per_segment = 3  # Increase this number for more ROIs per segment
+
+        for i in range(len(contour)):
+            pt1 = contour[i]
+            pt2 = contour[(i + 1) % len(contour)]
+            # Compute the direction vector
+            dx, dy = pt2 - pt1
+            length = np.hypot(dx, dy)
+            if length == 0:
+                continue
+            # Unit direction vector
+            ux, uy = dx / length, dy / length
+            # Perpendicular vector
+            px, py = -uy, ux
+
+            for s in range(num_samples_per_segment):
+                t = (s + 0.5) / num_samples_per_segment  # sample at evenly spaced positions
+                cx = pt1[0] + t * dx
+                cy = pt1[1] + t * dy
+
+                # Four corners of the patch
+                corners = np.array([
+                    [cx - ux * patch_length / 2 - px * patch_width / 2, cy - uy * patch_length / 2 - py * patch_width / 2],
+                    [cx + ux * patch_length / 2 - px * patch_width / 2, cy + uy * patch_length / 2 - py * patch_width / 2],
+                    [cx + ux * patch_length / 2 + px * patch_width / 2, cy + uy * patch_length / 2 + py * patch_width / 2],
+                    [cx - ux * patch_length / 2 + px * patch_width / 2, cy - uy * patch_length / 2 + py * patch_width / 2],
+                ], dtype=np.float32)
+
+                # Destination rectangle
+                dst_rect = np.array([
+                    [0, 0],
+                    [patch_length - 1, 0],
+                    [patch_length - 1, patch_width - 1],
+                    [0, patch_width - 1]
+                ], dtype=np.float32)
+
+                # Perspective transform
+                M = cv2.getPerspectiveTransform(corners, dst_rect)
+                patch = cv2.warpPerspective(img, M, (patch_length, patch_width))
+
+                # Save the patch image
+                patch_filename = os.path.join(output_dir, f"segment_{i:03d}_sample_{s:02d}.png")
+                cv2.imwrite(patch_filename, patch)
+
+                # Convert to RGB for pytesseract
+                patch_rgb = cv2.cvtColor(patch, cv2.COLOR_BGR2RGB)
+                text = pytesseract.image_to_string(patch_rgb, config='--psm 6').strip()
+                print(f"Segment {i} sample {s}: '{text}' (saved as {patch_filename})")
+
+                # Highlight candidate if text is non-empty
+                if text:
+                    corners_int = np.int32(corners)
+                    cv2.polylines(highlight_img, [corners_int], isClosed=True, color=(0, 255, 255), thickness=2)
+                    x, y, w, h = cv2.boundingRect(corners_int)
+                    cv2.rectangle(highlight_img, (x, y), (x + w, y + h), (0, 0, 255), 2)
+                    cv2.putText(
+                        highlight_img, text, (corners_int[0][0], corners_int[0][1] - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA
+                    )
+
+        # Show the highlighted image in the GUI
+        self.image = highlight_img
+        self.update_canvas_image()        
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
