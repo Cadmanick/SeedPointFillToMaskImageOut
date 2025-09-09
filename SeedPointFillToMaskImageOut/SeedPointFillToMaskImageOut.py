@@ -17,7 +17,6 @@ class FloodFillApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Flood Fill PDF Mask Generator")
-
         self.canvas_width = 800
         self.canvas_height = 600
 
@@ -182,6 +181,30 @@ class FloodFillApp:
         # self.distance_regex_entry.pack(side=tk.LEFT, padx=2)
         # self.distance_regex_entry.insert(0, r"\d{1,4}\.\d{1,3}\s?'")
 
+        # Add contrast slider
+        self.contrast_slider = Scale(
+            self.button_frame,
+            from_=0.5, to=2.0,
+            resolution=0.01,
+            orient=tk.HORIZONTAL,
+            label="Contrast"
+        )
+        self.contrast_slider.set(1.0)
+        self.contrast_slider.pack()
+
+        # Ensure preview updates when slider moves
+        self.contrast_slider.config(command=lambda v: self.update_preview())
+
+        # Add kernel size slider for morphological operations
+        self.kernel_slider = Scale(
+            self.button_frame,
+            from_=5, to=100,
+            orient=tk.HORIZONTAL,
+            label="Kernel Size"
+        )
+        self.kernel_slider.set(5)
+        self.kernel_slider.pack()
+
     def autoload_pdf(self, filename):
         import os
         if os.path.exists(filename):
@@ -265,7 +288,6 @@ class FloodFillApp:
         aggressiveness = self.aggressiveness_slider.get()
 
         for point in self.seed_points:
-            # Use FIXED_RANGE to ensure initial fill works
             cv2.floodFill(
                 flood_img, mask, point, (255, 255, 255),
                 (aggressiveness,) * 3, (aggressiveness,) * 3,
@@ -274,6 +296,13 @@ class FloodFillApp:
 
         # Remove border and scale mask for display
         mask = mask[1:-1, 1:-1]
+
+        # Use kernel size from slider for morphological closing
+        kernel_size = self.kernel_slider.get()
+        if kernel_size > 1:
+            kernel = np.ones((kernel_size, kernel_size), np.uint8)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
         if np.count_nonzero(mask) == 0:
             print("Flood fill did not mark any mask pixels. Try adjusting aggressiveness or seed point.")
         self.mask = mask * 255
@@ -285,6 +314,10 @@ class FloodFillApp:
             return
 
         preview = self.viewport.get_view(self.original_image.copy())
+
+        # Apply contrast adjustment
+        contrast = self.contrast_slider.get()
+        preview = cv2.convertScaleAbs(preview, alpha=contrast, beta=0)
 
         # Inverse correlation between aggressiveness and threshold
         max_aggressiveness = self.aggressiveness_slider.cget("to")
@@ -333,8 +366,16 @@ class FloodFillApp:
             # Resize mask to canvas size
             if cropped_mask.size > 0:
                 resized_mask = cv2.resize(cropped_mask, (canvas_w, canvas_h), interpolation=cv2.INTER_NEAREST)
-                # Overlay mask: set preview pixels to green where mask is 255
-                preview[resized_mask == 255] = [0, 255, 0]
+                # Create a green mask overlay
+                green_overlay = np.zeros_like(preview)
+                green_overlay[:, :, 1] = 255  # Green channel
+
+                # Create alpha mask
+                alpha = (resized_mask == 255).astype(np.float32) * 0.4  # 0.4 = 40% opacity
+
+                # Blend preview and green overlay using alpha mask
+                for c in range(3):
+                    preview[:, :, c] = (preview[:, :, c] * (1 - alpha) + green_overlay[:, :, c] * alpha).astype(np.uint8)
 
         # Draw seed points
         for x, y in self.seed_points:
@@ -1093,6 +1134,13 @@ class Viewport:
         # Resize to canvas size
         resized = cv2.resize(canvas, (self.canvas_width, self.canvas_height), interpolation=cv2.INTER_AREA)
         return resized
+
+    def preprocess_for_dashed_lines(image, dash_gap_size=10, orientation='horizontal'):
+        if orientation == 'horizontal':
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (dash_gap_size, 1))
+        else:
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, dash_gap_size))
+        return cv2.morphologyEx(image, cv2.MORPH_CLOSE, kernel)
 
 
 if __name__ == "__main__":
