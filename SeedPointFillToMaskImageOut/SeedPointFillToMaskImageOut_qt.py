@@ -1,4 +1,4 @@
-import sys
+﻿import sys
 import math
 import numpy as np
 import cv2
@@ -462,8 +462,139 @@ class FloodFillApp(QMainWindow):
         self.update_canvas_image()
 
     def extract_text_along_decimated_lines(self):
-        # Port your logic from Tkinter's extract_text_along_decimated_lines here
-        pass
+        import re
+        try:
+            import pytesseract
+        except ImportError:
+            print("pytesseract is not installed. Install with: pip install pytesseract")
+            return None
+
+        if self.image is None or self.decimated_contour is None:
+            return None
+
+        img = self.original_image.copy()  # Use original for drawing boxes
+        contour = self.decimated_contour
+        line_width = 100
+        results = []
+
+        # Use the largest contour for distance calculation
+        if hasattr(self, 'outer_contour') and self.outer_contour is not None:
+            main_contour = max(self.outer_contour, key=cv2.contourArea)
+        else:
+            main_contour = contour
+
+        max_distance_to_contour = 100  # pixels
+
+        for i in range(len(contour)):
+            pt1 = contour[i][0]
+            pt2 = contour[(i + 1) % len(contour)][0]
+
+            dx = pt2[0] - pt1[0]
+            dy = pt2[1] - pt1[1]
+            length = int(math.hypot(dx, dy))
+            if length < 10:
+                continue
+
+            # Midpoint of the segment
+            mx = int((pt1[0] + pt2[0]) / 2)
+            my = int((pt1[1] + pt2[1]) / 2)
+
+            # Distance from midpoint to contour
+            dist = cv2.pointPolygonTest(main_contour, (mx, my), True)
+            if abs(dist) > max_distance_to_contour:
+                continue  # Skip if farther than 100 pixels
+
+            angle = math.degrees(math.atan2(dy, dx))
+            cx = (pt1[0] + pt2[0]) / 2.0
+            cy = (pt1[1] + pt2[1]) / 2.0
+
+            try:
+                M = cv2.getRotationMatrix2D((cx, cy), angle, 1.0)
+                rotated = cv2.warpAffine(img, M, (img.shape[1], img.shape[0]), flags=cv2.INTER_CUBIC)
+
+                pts = np.array([[pt1], [pt2]], dtype=np.float32)
+                pts_rot = cv2.transform(pts, M)
+                x1r, y1r = pts_rot[0][0]
+                x2r, y2r = pts_rot[1][0]
+
+                x_min = int(min(x1r, x2r))
+                x_max = int(max(x1r, x2r))
+                y_center = int((y1r + y2r) / 2)
+                y_min = max(0, y_center - line_width // 2)
+                y_max = min(rotated.shape[0], y_center + line_width // 2)
+
+                if x_min >= x_max or y_min >= y_max:
+                    continue
+                roi = rotated[y_min:y_max, x_min:x_max]
+                if roi.size == 0 or roi.shape[0] < 5 or roi.shape[1] < 5:
+                    continue
+
+                # OCR: extract text from ROI (normal)
+                ocr_text = pytesseract.image_to_string(roi, config="--psm 6").strip()
+                # OCR: extract text from ROI (inverted)
+                roi_inverted = cv2.rotate(roi, cv2.ROTATE_180)
+                ocr_text_inverted = pytesseract.image_to_string(roi_inverted, config="--psm 6").strip()
+
+                # Combine results
+                all_texts = [ocr_text, ocr_text_inverted]
+                number_matches = []
+                for text in all_texts:
+                    number_matches += re.findall(r"\d{1,4}(?:\.\d{1,3})?\s*['\"]?", text)
+                distances = []
+                for match in number_matches:
+                    num_str = re.sub(r"[^\d.]", "", match)
+                    if '.' in num_str:
+                        try:
+                            distances.append(float(num_str))
+                        except ValueError:
+                            continue
+
+                distance_sum = sum(distances) if distances else 0.0
+                results.append([i, distance_sum])
+
+                # --- Draw ROI box on the original image ---
+                # Calculate the four corners of the ROI in the original image coordinates
+                # The ROI is a rectangle along the segment, centered at the midpoint
+                # We'll use the same logic as in ocr_along_contour for the box
+                roi_length = int(math.hypot(dx, dy))
+                roi_width = line_width
+                # Unit direction vector
+                if roi_length == 0:
+                    continue
+                ux, uy = dx / roi_length, dy / roi_length
+                px, py = -uy, ux
+                # Four corners
+                corners = np.array([
+                    [cx - ux * roi_length / 2 - px * roi_width / 2, cy - uy * roi_length / 2 - py * roi_width / 2],
+                    [cx + ux * roi_length / 2 - px * roi_width / 2, cy + uy * roi_length / 2 - py * roi_width / 2],
+                    [cx + ux * roi_length / 2 + px * roi_width / 2, cy + uy * roi_length / 2 + py * roi_width / 2],
+                    [cx - ux * roi_length / 2 + px * roi_width / 2, cy - uy * roi_length / 2 + py * roi_width / 2],
+                ], dtype=np.int32)
+                cv2.polylines(img, [corners], isClosed=True, color=(0, 255, 255), thickness=2)  # Yellow box
+
+            except Exception as e:
+                print(f"Exception on line {i}: {e}")
+                continue
+
+        # Display results in the table at bottom right (QTextEdit)
+        self.table_text.clear()
+        if results:
+            for idx, distance_sum in results:
+                self.table_text.append(f"Contour {idx}: Distance sum = {distance_sum:.2f}")
+        else:
+            self.table_text.append("No distances found along decimated contour lines.")
+
+        # Append scale factor to the table
+        if self.SCALE_FACTOR is not None:
+            self.table_text.append(f"\nScale Factor: {self.SCALE_FACTOR:.4f} meters/pixel")
+        else:
+            self.table_text.append("\nScale Factor: Not set")
+
+        # Show the image with ROI boxes in the GUI
+        self.image = img
+        self.update_canvas_image()
+
+        return results if results else None
 
     def export_geotiff(self):
         # Port your logic from Tkinter's export_geotiff here
@@ -474,8 +605,116 @@ class FloodFillApp(QMainWindow):
         pass
 
     def calculate_scale_factor(self):
-        # Port your logic from Tkinter's calculate_scale_factor here
-        pass
+        self.line_points = []
+
+        # Try to get array from extract_text_along_decimated_lines
+        contour_distances = self.extract_text_along_decimated_lines()
+        print("contour_distances:", contour_distances)
+        # Expected format: [(contour_number, real_distance_feet), ...]
+        pixel_lengths = []
+        real_distances_meters = []
+
+        if contour_distances:
+            # For each contour segment, get pixel length and real-world distance
+            for contour_number, real_distance_feet in contour_distances:
+                print(f"Contour {contour_number}: OCR feet={real_distance_feet}")
+                pt1 = self.decimated_contour[contour_number][0]
+                pt2 = self.decimated_contour[(contour_number + 1) % len(self.decimated_contour)][0]
+                pixel_length = math.hypot(pt2[0] - pt1[0], pt2[1] - pt1[1])
+                print(f"Pixel length: {pixel_length}")
+                print(f"Real distance (meters): {real_distance_feet * 0.3048}")
+                pixel_lengths.append(pixel_length)
+                real_distances_meters.append(real_distance_feet * 0.3048)
+
+            # Simple average: only use valid (nonzero) segments
+            valid_pairs = [(pl, rd) for pl, rd in zip(pixel_lengths, real_distances_meters) if rd > 0]
+            if valid_pairs:
+                pixel_lengths_valid, real_distances_valid = zip(*valid_pairs)
+                avg_pixel_length = sum(pixel_lengths_valid) / len(pixel_lengths_valid)
+                avg_real_distance = sum(real_distances_valid) / len(real_distances_valid)
+                if avg_real_distance > 0 and avg_pixel_length > 0:
+                    self.SCALE_FACTOR = avg_real_distance / avg_pixel_length  # meters per pixel
+                    self.PIXEL_SCALE = avg_pixel_length / avg_real_distance   # pixels per meter
+                    self.scale_factor_label.setText(
+                        f"Scale Factor: {self.SCALE_FACTOR:.4f} meters/pixel, Pixel Scale: {self.PIXEL_SCALE:.2f} pixels/meter"
+                    )
+                    print(f"Scale factor set to {self.SCALE_FACTOR:.4f} meters/pixel")
+                    print(f"Pixel scale set to {self.PIXEL_SCALE:.2f} pixels/meter")
+                    return
+
+        # Fallback: manual input via two clicks and entry
+        from PyQt5.QtGui import QPainter, QPen
+        from PyQt5.QtCore import QPoint
+
+        self.statusBar().showMessage("Click two points on the image to define the scale line.")
+
+        def on_canvas_click(x, y):
+            img_x, img_y = self.canvas_to_image_coords(x, y)
+            self.line_points.append((img_x, img_y))
+
+            # Draw a small circle at the clicked point
+            pixmap = self.canvas.pixmap().copy()
+            qp = QPainter(pixmap)
+            pen = QPen(QColor("cyan"))
+            pen.setWidth(4)
+            qp.setPen(pen)
+            qp.drawEllipse(QPoint(x, y), 4, 4)
+            qp.end()
+            self.canvas.setPixmap(pixmap)
+
+            if len(self.line_points) == 2:
+                # Disconnect after two points
+                self.canvas.left_click.disconnect(on_canvas_click)
+                x1, y1 = self.line_points[0]
+                x2, y2 = self.line_points[1]
+
+                # Draw the scale line
+                pixmap = self.canvas.pixmap().copy()
+                qp = QPainter(pixmap)
+                pen = QPen(QColor("cyan"))
+                pen.setWidth(2)
+                qp.setPen(pen)
+                # Convert image coords to canvas coords
+                def img_to_canvas_coords(ix, iy):
+                    canvas_w, canvas_h = self.canvas.width(), self.canvas.height()
+                    img_h, img_w = self.original_image.shape[:2]
+                    scale = self.zoom_level
+                    new_w = int(img_w * scale)
+                    new_h = int(img_h * scale)
+                    img_x0 = (canvas_w - new_w) // 2 + self.pan_x
+                    img_y0 = (canvas_h - new_h) // 2 + self.pan_y
+                    cx = int(ix * scale + img_x0)
+                    cy = int(iy * scale + img_y0)
+                    return cx, cy
+                cx1, cy1 = img_to_canvas_coords(x1, y1)
+                cx2, cy2 = img_to_canvas_coords(x2, y2)
+                qp.drawLine(cx1, cy1, cx2, cy2)
+                qp.end()
+                self.canvas.setPixmap(pixmap)
+
+                # Get real-world distance from input
+                try:
+                    real_distance_feet = float(self.real_distance_entry.text())
+                except ValueError:
+                    self.statusBar().showMessage("Invalid real-world distance entered.")
+                    return
+
+                real_distance_meters = real_distance_feet * 0.3048
+                pixel_distance = math.hypot(x2 - x1, y2 - y1)
+
+                if real_distance_meters == 0 or pixel_distance == 0:
+                    self.statusBar().showMessage("Distances must be non-zero.")
+                    return
+
+                self.SCALE_FACTOR = real_distance_meters / pixel_distance  # meters per pixel
+                self.PIXEL_SCALE = pixel_distance / real_distance_meters   # pixels per meter
+
+                self.scale_factor_label.setText(
+                    f"Scale Factor: {self.SCALE_FACTOR:.4f} meters/pixel, Pixel Scale: {self.PIXEL_SCALE:.2f} pixels/meter"
+                )
+                self.statusBar().showMessage("Scale factor calculated.")
+
+        self.canvas.left_click.connect(on_canvas_click)
 
     def update_preview(self):
         if self.original_image is None:
@@ -549,7 +788,7 @@ class FloodFillApp(QMainWindow):
 
         largest_contour = max(contours, key=cv2.contourArea)
         slider_value = self.simplify_slider['slider'].value()  # 1-100
-        epsilon = (slider_value / 1000.0) * cv2.arcLength(largest_contour, True)  # 0.001�0.1 * arcLength
+        epsilon = (slider_value / 1000.0) * cv2.arcLength(largest_contour, True)  # 0.0010.1 * arcLength
         simplified = cv2.approxPolyDP(largest_contour, epsilon, True)
 
         print(f"Original points: {len(largest_contour)}, Simplified: {len(simplified)}, Epsilon: {epsilon:.4f}, Kernel: {kernel_size}")
