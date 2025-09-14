@@ -1,4 +1,4 @@
-#SeedPointFillToMaskImageOut_qt(r).py
+#SeedPointFillToMaskImageOut_qt(r2).py
 
 
 import sys
