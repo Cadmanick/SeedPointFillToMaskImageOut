@@ -1,4 +1,4 @@
-#SeedPointFillToMaskImageOut_qt(r4).py
+#SeedPointFillToMaskImageOut_qt(r4.5).py
 
 
 import sys
@@ -85,6 +85,7 @@ class FloodFillApp(QMainWindow):
         self.brown_line_mode = False
         self.brown_line_points = []
         self.brown_lines = []  # Store all brown lines as [(pt1, pt2), ...]
+        self.default_pdf_folder = os.path.expanduser("D:\temp\PlatsForTest")  # or set to your preferred default path
 
         # --- Main layout ---
         central = QWidget()
@@ -95,7 +96,7 @@ class FloodFillApp(QMainWindow):
         slider_layout = QHBoxLayout()
         main_layout.addLayout(slider_layout)
 
-        self.aggressiveness_slider = self._make_slider("Aggressiveness", 0, 255, 25, self.update_preview)
+        self.aggressiveness_slider = self._make_slider("Aggressiveness", 0, 255, 25, self.on_aggressiveness_slider_changed)
         slider_layout.addWidget(self.aggressiveness_slider['widget'])
         slider_layout.addSpacing(20)
 
@@ -103,20 +104,21 @@ class FloodFillApp(QMainWindow):
         slider_layout.addWidget(self.pixel_slider['widget'])
         slider_layout.addSpacing(20)
 
-        self.simplify_slider = self._make_slider("Simplify Contour", 1, 100, 5, self.create_simplified_contour)
-        slider_layout.addWidget(self.simplify_slider['widget'])
-        slider_layout.addSpacing(20)
-
-        self.contrast_slider = self._make_slider("Contrast", 0, 200, 100, self.update_preview)
+        self.contrast_slider = self._make_slider("Contrast", 0, 200, 100, self.on_contrast_slider_changed)
         slider_layout.addWidget(self.contrast_slider['widget'])
         slider_layout.addSpacing(20)
 
-        self.kernel_slider = self._make_slider("Kernel Size", 5, 100, 5, self.create_simplified_contour)
+        self.kernel_slider = self._make_slider("Kernel Size", 5, 100, 5, self.on_kernel_slider_changed)
         slider_layout.addWidget(self.kernel_slider['widget'])
         slider_layout.addSpacing(20)
 
         self.lambda_slider = self._make_slider("Lambda", 0, 100, 0, self.update_preview)
         slider_layout.addWidget(self.lambda_slider['widget'])
+        slider_layout.addSpacing(20)
+
+        self.simplify_slider = self._make_slider("Simplify Contour", 1, 100, 5, self.on_simplify_slider_changed)
+        slider_layout.addWidget(self.simplify_slider['widget'])
+        slider_layout.addSpacing(20)
 
         # --- Canvas below sliders ---
         self.canvas = CanvasWidget()
@@ -219,6 +221,22 @@ class FloodFillApp(QMainWindow):
         # self.resize_timer.setSingleShot(True)
         # self.resize_timer.timeout.connect(self.update_canvas_image)
 
+        self.aggressiveness_timer = QTimer(self)
+        self.aggressiveness_timer.setSingleShot(True)
+        self.aggressiveness_timer.timeout.connect(self.update_preview)
+
+        self.contrast_timer = QTimer(self)
+        self.contrast_timer.setSingleShot(True)
+        self.contrast_timer.timeout.connect(self.update_preview)
+
+        self.kernel_timer = QTimer(self)
+        self.kernel_timer.setSingleShot(True)
+        self.kernel_timer.timeout.connect(self.create_simplified_contour)
+
+        self.simplify_timer = QTimer(self)
+        self.simplify_timer.setSingleShot(True)
+        self.simplify_timer.timeout.connect(self.create_simplified_contour)
+
     def _make_slider(self, label, minv, maxv, val, slot=None):
         from PyQt5.QtWidgets import QVBoxLayout, QHBoxLayout, QWidget
         w = QWidget()
@@ -271,28 +289,28 @@ class FloodFillApp(QMainWindow):
         # Port your logic from Tkinter's reset_mouse_pos here
         pass
 
-    def apply_flood_fill(self):
-        if self.image is None or not self.seed_points:
-            return
+    # def apply_flood_fill(self):
+    #     if self.image is None or not self.seed_points:
+    #         return
 
-        flood_img = self.image.copy()
-        h, w = flood_img.shape[:2]
-        mask = np.zeros((h + 2, w + 2), np.uint8)
-        aggressiveness = self.aggressiveness_slider['slider'].value()
+    #     flood_img = self.image.copy()
+    #     h, w = flood_img.shape[:2]
+    #     mask = np.zeros((h + 2, w + 2), np.uint8)
+    #     aggressiveness = self.aggressiveness_slider['slider'].value()
 
-        for point in self.seed_points:
-            cv2.floodFill(
-                flood_img, mask, point, (255, 255, 255),
-                (aggressiveness,) * 3, (aggressiveness,) * 3,
-                flags=cv2.FLOODFILL_MASK_ONLY | cv2.FLOODFILL_FIXED_RANGE
-            )
+    #     for point in self.seed_points:
+    #         cv2.floodFill(
+    #             flood_img, mask, point, (255, 255, 255),
+    #             (aggressiveness,) * 3, (aggressiveness,) * 3,
+    #             flags=cv2.FLOODFILL_MASK_ONLY | cv2.FLOODFILL_FIXED_RANGE
+    #         )
 
-        # Remove border and scale mask for display
-        mask = mask[1:-1, 1:-1]
+    #     # Remove border and scale mask for display
+    #     mask = mask[1:-1, 1:-1]
 
-        if np.count_nonzero(mask) == 0:
-            print("Flood fill did not mark any mask pixels. Try adjusting aggressiveness or seed point.")
-        self.mask = mask * 255
+    #     if np.count_nonzero(mask) == 0:
+    #         print("Flood fill did not mark any mask pixels. Try adjusting aggressiveness or seed point.")
+    #     self.mask = mask * 255
 
     def flood_fill_and_show_mask_contours(self):
         if self.image is None or not self.seed_points:
@@ -303,15 +321,30 @@ class FloodFillApp(QMainWindow):
         flood_img = self.original_image.copy()
         h, w = flood_img.shape[:2]
         mask = np.zeros((h + 2, w + 2), np.uint8)
+
+        mask[0, :] = 1
+        mask[-1, :] = 1
+        mask[:, 0] = 1
+        mask[:, -1] = 1
+
         aggressiveness = self.aggressiveness_slider['slider'].value()
+
+        # --- Morphological operations to close gaps and thicken boundaries ---
+        # gray = cv2.cvtColor(flood_img, cv2.COLOR_BGR2GRAY)
+        # _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # kernel_size = self.kernel_slider['slider'].value()
+        # kernel = np.ones((kernel_size, kernel_size), np.uint8)
+        # closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+        # dilated = cv2.dilate(closed, kernel, iterations=1)
+        # flood_img = cv2.cvtColor(dilated, cv2.COLOR_GRAY2BGR)
+        # ---------------------------------------------------------------------
 
         # Draw brown lines as barriers on the mask (before flood fill)
         if hasattr(self, 'brown_lines'):
             for pt1, pt2 in self.brown_lines:
-                # Shift by +1 for mask offset (OpenCV floodFill uses mask with 1-pixel border)
                 pt1_mask = (pt1[0] + 1, pt1[1] + 1)
                 pt2_mask = (pt2[0] + 1, pt2[1] + 1)
-                cv2.line(mask, pt1_mask, pt2_mask, color=1, thickness=5)  # 1 blocks flood fill
+                cv2.line(mask, pt1_mask, pt2_mask, color=1, thickness=5)
 
         # Accumulate mask for all seed points
         for point in self.seed_points:
@@ -407,7 +440,12 @@ class FloodFillApp(QMainWindow):
         # file_path = r"D:\temp\PlatsForTest\PB0027_PG0048 - K-4716.pdf"
         #------------------- comment above line and uncomment below for dialog--------------------
 
-        file_path, _ = QFileDialog.getOpenFileName(self, "Open PDF", "", "PDF Files (*.pdf)")
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open PDF",
+            self.default_pdf_folder,
+            "PDF Files (*.pdf)"
+)
         if not file_path:
             return
 
@@ -515,6 +553,7 @@ class FloodFillApp(QMainWindow):
         if hasattr(self, 'original_image') and self.original_image is not None:
             self.image = self.original_image.copy()
         self.found_contours = []
+        self.brown_lines = []  # Clear all brown lines
         self.update_canvas_image()
 
     def fit_to_view(self):
@@ -655,6 +694,7 @@ class FloodFillApp(QMainWindow):
                     canvas_w, canvas_h = self.canvas.width(), self.canvas.height()
                     img_h, img_w = self.original_image.shape[:2]
                     scale = self.zoom_level
+                    # this logic is intentional, do not change
                     new_w = int(img_w * scale)
                     new_h = int(img_h * scale)
                     img_x0 = (canvas_w - new_w) // 2 + self.pan_x
@@ -1180,6 +1220,7 @@ class FloodFillApp(QMainWindow):
         canvas_x = int(img_x * scale + img_x0)
         canvas_y = int(img_y * scale + img_y0)
         return canvas_x, canvas_y
+
     def robust_scale_factor(self, pixel_lengths, real_distances_meters):
         """
         Robustly calculate scale factor (meters per pixel) using least squares and outlier rejection.
@@ -1214,6 +1255,24 @@ class FloodFillApp(QMainWindow):
             pixel_scale = None
 
         return scale_factor, pixel_scale, inlier_mask
+
+    def on_aggressiveness_slider_changed(self):
+        # Restart the timer every time the slider value changes
+        self.aggressiveness_timer.start(200)
+
+    def on_contrast_slider_changed(self):
+        self.contrast_timer.start(200)
+
+    def on_kernel_slider_changed(self):
+        self.kernel_timer.start(200)
+
+    def on_simplify_slider_changed(self):
+        self.simplify_timer.start(200)
+
+
+
+
+
 
 
 
