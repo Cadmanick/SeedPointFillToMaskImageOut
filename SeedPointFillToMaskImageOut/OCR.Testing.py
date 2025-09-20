@@ -379,7 +379,7 @@ class MainWindow(QMainWindow):
         # 5. Draw blue rectangles for each word
         img_with_boxes = img.copy()
         for (x1, y1, x2, y2) in word_boxes:
-            cv2.rectangle(img_with_boxes, (x1, y1), (x2, y2), (255, 0, 0), 2)  # Blue
+            cv2.rectangle(img_with_boxes, (x1, y1), (x2, y2), (0, 0, 255), 2)  # Blue
 
         self.image_label.set_image(img_with_boxes)
 
