@@ -4,13 +4,14 @@
     <SchemaVersion>2.0</SchemaVersion>
     <ProjectGuid>124c00cb-fb0b-4f47-b982-bd302903dc3b</ProjectGuid>
     <ProjectHome>.</ProjectHome>
-    <StartupFile>SeedPointFillToMaskImageOut.py</StartupFile>
+    <StartupFile>OCR.Testing.py</StartupFile>
     <SearchPath>
     </SearchPath>
     <WorkingDirectory>.</WorkingDirectory>
     <OutputPath>.</OutputPath>
     <Name>SeedPointFillToMaskImageOut</Name>
     <RootNamespace>SeedPointFillToMaskImageOut</RootNamespace>
+    <IsWindowsApplication>False</IsWindowsApplication>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)' == 'Debug' ">
     <DebugSymbols>true</DebugSymbols>
@@ -22,6 +23,9 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="SeedPointFillToMaskImageOut.py" />
+  </ItemGroup>
+  <ItemGroup>
+    <Content Include="OCR.Testing.py" />
   </ItemGroup>
   <Import Project="$(MSBuildExtensionsPath32)\Microsoft\VisualStudio\v$(VisualStudioVersion)\Python Tools\Microsoft.PythonTools.targets" />
   <!-- Uncomment the CoreCompile target to enable the Build command in
