@@ -4,7 +4,7 @@
     <SchemaVersion>2.0</SchemaVersion>
     <ProjectGuid>124c00cb-fb0b-4f47-b982-bd302903dc3b</ProjectGuid>
     <ProjectHome>.</ProjectHome>
-    <StartupFile>OCR.Testing.py</StartupFile>
+    <StartupFile>OCR.Testing_LATEST.py</StartupFile>
     <SearchPath>
     </SearchPath>
     <WorkingDirectory>.</WorkingDirectory>
@@ -25,7 +25,7 @@
     <Compile Include="SeedPointFillToMaskImageOut.py" />
   </ItemGroup>
   <ItemGroup>
-    <Content Include="OCR.Testing.py" />
+    <Content Include="OCR.Testing_LATEST.py" />
   </ItemGroup>
   <Import Project="$(MSBuildExtensionsPath32)\Microsoft\VisualStudio\v$(VisualStudioVersion)\Python Tools\Microsoft.PythonTools.targets" />
   <!-- Uncomment the CoreCompile target to enable the Build command in
