@@ -1,4 +1,6 @@
-﻿import sys
+﻿#OCR.Testing_LATEST.py
+
+import sys
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout,
     QPushButton, QGraphicsView, QGraphicsScene, QFileDialog, QSizePolicy,
@@ -148,7 +150,7 @@ def merge_boxes(boxes, x_thresh=20, y_thresh=10):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("PNG Loader (Dark Mode, Zoom & Pan)")
+        self.setWindowTitle("OCR Testing | Automatic Text Detection w/Adjustments")
 
         self.viewer = ImageViewer()
 
@@ -163,16 +165,20 @@ class MainWindow(QMainWindow):
         # --- Mode radio buttons ---
         self.adjust_radio = QRadioButton("Image Adjustment Only")
         self.text_radio = QRadioButton("Image Adjustment w/ Automatic Text Detection")
-        self.adjust_radio.setChecked(True)
+        self.invert_radio = QRadioButton("Invert 180°")
+        self.text_radio.setChecked(True)  # <-- Start in text mode
         self.mode_group = QButtonGroup()
         self.mode_group.addButton(self.adjust_radio)
         self.mode_group.addButton(self.text_radio)
-        self.adjust_radio.toggled.connect(self.on_mode_changed)
-        self.text_radio.toggled.connect(self.on_mode_changed)
+        # Invert is not mutually exclusive, so not added to mode_group
+
+        self.invert_radio.toggled.connect(self.on_mode_changed)
+
         radio_layout = QHBoxLayout()
         radio_layout.addWidget(QLabel("Mode:"))
         radio_layout.addWidget(self.adjust_radio)
         radio_layout.addWidget(self.text_radio)
+        radio_layout.addWidget(self.invert_radio)
 
         # --- Sliders for real-time adjustment ---
         self.brightness_slider = QSlider(Qt.Horizontal)
@@ -239,8 +245,8 @@ class MainWindow(QMainWindow):
         self.resize(800, 700)
 
         self._last_pixmap = None
-
-        self.connect_sliders(self.update_preview)
+        self.connect_sliders(self.highlight_text)  # <-- Connect sliders to highlight_text for text mode
+        self.highlight_text()  # <-- Highlight text on startup
 
     def connect_sliders(self, slot):
         try:
@@ -303,9 +309,10 @@ class MainWindow(QMainWindow):
             adj = cv2.dilate(adj, kernel, iterations=dilation_iter)
         return adj
 
-    def highlight_text(self):
+    def get_current_image_array(self):
+        """Get the current image as a numpy array, applying invert if needed."""
         if not self._last_pixmap:
-            return
+            return None
         qimg = self._last_pixmap.toImage().convertToFormat(QImage.Format.Format_RGB888)
         width, height = qimg.width(), qimg.height()
         bytes_per_line = qimg.bytesPerLine()
@@ -313,6 +320,16 @@ class MainWindow(QMainWindow):
         ptr.setsize(qimg.byteCount())
         arr = np.array(ptr, dtype=np.uint8).reshape((height, bytes_per_line))
         arr = arr[:, :width * 3].reshape((height, width, 3))
+        if self.invert_radio.isChecked():
+            arr = cv2.rotate(arr, cv2.ROTATE_180)
+        return arr
+
+    def highlight_text(self):
+        if not self._last_pixmap:
+            return
+        arr = self.get_current_image_array()
+        if arr is None:
+            return
         pre = self.preprocess_for_ocr(arr)
         if len(pre.shape) == 2:
             pre_rgb = cv2.cvtColor(pre, cv2.COLOR_GRAY2RGB)
@@ -326,6 +343,7 @@ class MainWindow(QMainWindow):
         data = pytesseract.image_to_data(pre, output_type=pytesseract.Output.DICT, config=custom_config)
         boxes = []
         expand = 4
+        width, height = pre.shape[1], pre.shape[0]
         for i in range(len(data['text'])):
             text = data['text'][i]
             if text.strip() and any(c.isalnum() for c in text):
@@ -333,6 +351,7 @@ class MainWindow(QMainWindow):
                 text = text.replace('’', "").replace('”', '')
                 text = text.replace('"', "").replace("'", "")
                 text = text.replace('_', '')
+                text = text.replace('%', '')
                 text = re.sub(r'[a-z]', '', text)
                 if re.match(r'^[NWSE]', text):
                     text = re.sub(r'[^A-Z0-9]', '', text)
@@ -344,15 +363,20 @@ class MainWindow(QMainWindow):
                         formatted = f"{direction} {digits[:2]} {digits[2:4]} {digits[4:6]}"
                         text = formatted
                 text = re.sub(r'([A-Z])\1+', r'\1', text)
-                text = text.replace(' ', '')  # <-- Ensure this is the last operation before checks and appending
-                # Only add box if text is not empty after all processing and box is not too small
+                text = text.replace('S', '5')
+                if len(text) > 7:
+                    text = text.replace('5', 'S')
+                text = text.replace('-', '')
+                text = text.replace(' ', '')
+                if text.endswith('.'):
+                    text = text[:-1]
                 if text.strip():
                     x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
                     x_exp = max(0, x - expand)
                     y_exp = max(0, y - expand)
                     w_exp = min(width - x_exp, w + 2 * expand)
                     h_exp = min(height - y_exp, h + 2 * expand)
-                    min_box_w, min_box_h = 10, 10  # Minimum width and height in pixels
+                    min_box_w, min_box_h = 10, 10
                     if w_exp >= min_box_w and h_exp >= min_box_h:
                         boxes.append((x_exp, y_exp, w_exp, h_exp, text))
         merged_boxes = merge_boxes(boxes, x_thresh=20, y_thresh=15)
@@ -361,13 +385,9 @@ class MainWindow(QMainWindow):
     def update_preview(self):
         if not self._last_pixmap:
             return
-        qimg = self._last_pixmap.toImage().convertToFormat(QImage.Format.Format_RGB888)
-        width, height = qimg.width(), qimg.height()
-        bytes_per_line = qimg.bytesPerLine()
-        ptr = qimg.bits()
-        ptr.setsize(qimg.byteCount())
-        arr = np.array(ptr, dtype=np.uint8).reshape((height, bytes_per_line))
-        arr = arr[:, :width * 3].reshape((height, width, 3))
+        arr = self.get_current_image_array()
+        if arr is None:
+            return
         pre = self.preprocess_for_ocr(arr)
         if len(pre.shape) == 2:
             pre_rgb = cv2.cvtColor(pre, cv2.COLOR_GRAY2RGB)

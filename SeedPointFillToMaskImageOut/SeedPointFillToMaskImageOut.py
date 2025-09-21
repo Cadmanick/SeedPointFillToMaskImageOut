@@ -1,133 +1,71 @@
-# 
-# 
-# SeedPointToMaskOut
-import tkinter as tk
-from tkinter import filedialog, Canvas, Scale, Button, Entry, Label
-from PIL import Image, ImageTk
-import cv2
+﻿#SeedPointFillToMaskImageOut_qt(r7).py
+
+
+import sys
+import math
 import numpy as np
-from pdf2image import convert_from_path
+import cv2
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QLabel, QPushButton, QSlider, QLineEdit, QFileDialog, QTextEdit, QSizePolicy
+)
+from PyQt5.QtCore import Qt, pyqtSignal, QPoint, QTimer
+from PyQt5.QtGui import QPixmap, QImage, QColor, QCursor, QPainter, QPen
+import os
 import re
 import pytesseract
-import tifffile
-import math
 
+class CanvasWidget(QLabel):
+    left_click = pyqtSignal(int, int)
+    right_click = pyqtSignal(int, int)
+    middle_press = pyqtSignal(int, int)
+    middle_move = pyqtSignal(int, int)
+    middle_release = pyqtSignal()
+    mouse_wheel = pyqtSignal(int)
+    mouse_move = pyqtSignal(int, int)
+    resize_event = pyqtSignal(int, int)
 
-class FloodFillApp:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Flood Fill PDF Mask Generator")
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMouseTracking(True)
+        self.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.setStyleSheet("background: #ddd; border: 1px solid #888;")
+        self.setMinimumSize(800, 600)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.left_click.emit(event.x(), event.y())
+        elif event.button() == Qt.RightButton:
+            self.right_click.emit(event.x(), event.y())
+        elif event.button() == Qt.MiddleButton:
+            self.middle_press.emit(event.x(), event.y())
+
+    def mouseMoveEvent(self, event):
+        buttons = event.buttons()
+        if buttons & Qt.MiddleButton:
+            self.middle_move.emit(event.x(), event.y())
+        self.mouse_move.emit(event.x(), event.y())
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MiddleButton:
+            self.middle_release.emit()
+
+    def wheelEvent(self, event):
+        self.mouse_wheel.emit(event.angleDelta().y())
+
+    def resizeEvent(self, event):
+        self.resize_event.emit(event.size().width(), event.size().height())
+        super().resizeEvent(event)
+
+class FloodFillApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Flood Fill PDF Mask Generator")
+        self.resize(1000, 800)
+
+        # --- State variables ---
         self.canvas_width = 800
         self.canvas_height = 600
-
-        # Main vertical layout
-        self.main_frame = tk.Frame(root)
-        self.main_frame.pack(fill=tk.BOTH, expand=True)
-
-        # Top: Image preview pane
-        self.canvas = Canvas(self.main_frame, width=self.canvas_width, height=self.canvas_height)
-        self.canvas.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-
-        # Bottom: Horizontal layout for buttons and table
-        self.bottom_frame = tk.Frame(self.main_frame)
-        self.bottom_frame.pack(side=tk.BOTTOM, fill=tk.X)
-
-        # Left: Button panel
-        self.button_frame = tk.Frame(self.bottom_frame)
-        self.button_frame.pack(side=tk.LEFT, anchor=tk.SW, padx=10, pady=10)
-
-        self.load_button = Button(self.button_frame, text="Load PDF", command=self.load_pdf)
-        self.load_button.pack()
-
-        # Aggressiveness slider
-        self.aggressiveness_slider = Scale(self.button_frame, from_=60, to=180, orient=tk.HORIZONTAL, label="Aggressiveness")
-        self.aggressiveness_slider.set(70)
-        self.aggressiveness_slider.pack()
-
-        self.clear_button = Button(self.button_frame, text="Clear Canvas", command=self.clear_canvas)
-        self.clear_button.pack()
-        
-        self.fit_button = Button(self.button_frame, text="Fit to View", command=self.fit_to_view)
-        self.fit_button.pack()
-
-        # self.contour_button = Button(self.button_frame, text="Show Outer Contour", command=self.find_outer_contour)
-        # self.contour_button.pack()
-        
-        self.pixel_slider = Scale(self.button_frame, from_=1, to=30, orient=tk.HORIZONTAL, label="Gap Pixels")
-        self.pixel_slider.set(15)
-        self.pixel_slider.pack()
-
-        # self.fill_gaps_button = Button(self.button_frame, text="Fill Gaps in Contour", command=self.recompute_contour_with_closing)
-        # self.fill_gaps_button.pack()
-
-        self.extract_button = Button(self.button_frame, text="Extract Distances", command=self.extract_text_along_decimated_lines)
-        self.extract_button.pack()
-
-
-        self.scale_input_frame = tk.Frame(self.bottom_frame)
-        self.scale_input_frame.pack(side=tk.BOTTOM, anchor=tk.SW, padx=10, pady=5)
-
-        tk.Label(self.scale_input_frame, text="Real-world Distance (feet):", font=("Arial", 10)).pack(side=tk.LEFT)
-        self.real_distance_entry = Entry(self.scale_input_frame, width=10)
-        self.real_distance_entry.pack(side=tk.LEFT, padx=5)
-
-        Button(self.scale_input_frame, text="Calc Scale Factor", command=lambda: self.calculate_scale_factor()).pack(side=tk.LEFT)
-
-        self.scale_factor_label = Label(self.bottom_frame, text="Scale Factor: Not set", font=("Arial", 10), fg="blue")
-        self.scale_factor_label.pack(side=tk.BOTTOM, anchor=tk.SW, padx=10, pady=5)
-
-        self.line_points = []
-        self.SCALE_FACTOR = None
-        self.canvas.bind("<Button-3>", self.trace_line)  # Right-click to trace
-
-        self.export_geotiff_button = Button(self.button_frame, text="Export GeoTIFF", command=self.export_geotiff)
-        self.export_geotiff_button.pack()
-
-        # Add slider for contour decimation (simplification)
-        self.simplify_slider = Scale(
-            self.button_frame,
-            from_=0.001, to=0.01,
-            resolution=0.001,
-            orient=tk.HORIZONTAL,
-            label="Simplify Contour"
-        )
-        self.simplify_slider.set(0.001)
-        self.simplify_slider.pack(side=tk.LEFT)
-
-        # Add button to create simplified contour
-        self.simplify_button = Button(
-            self.button_frame,
-            text="Create Simplified Contour",
-            command=self.on_simplify_contour
-        )
-        self.simplify_button.pack(side=tk.LEFT)
-
-        # Add export button for decimated mask image
-        self.export_decmask_button = Button(
-            self.button_frame,
-            text="Export DecMaskImage.png",
-            command=self.export_decmask_image
-        )
-        self.export_decmask_button.pack(side=tk.LEFT)
-
-        # Right: Distance table
-        self.table_frame = tk.Frame(self.bottom_frame)
-        self.table_frame.pack(side=tk.RIGHT, anchor=tk.SE, padx=10, pady=10)
-
-        self.table_label = tk.Label(self.table_frame, text="Distances", font=("Arial", 12, "bold"))
-        self.table_label.pack()
-
-        self.table_text = tk.Text(self.table_frame, width=80, height=12, font=("Arial", 10))
-        self.table_text.pack()
-
-        # Mouse coordinates label (move to right below table)
-        self.coord_label = Label(self.table_frame, text="Mouse: (x, y)", font=("Arial", 10), fg="black")
-        self.coord_label.pack(side=tk.BOTTOM, anchor=tk.SE, padx=10, pady=2)
-
-        self.distance_label = Label(self.table_frame, text="Measured Distance: N/A", font=("Arial", 10), fg="green")
-        self.distance_label.pack(side=tk.BOTTOM, anchor=tk.SE, padx=10, pady=2)
-
-        # Canvas interaction variables
         self.image = None
         self.tk_image = None
         self.seed_points = []
@@ -136,157 +74,265 @@ class FloodFillApp:
         self.pan_x = 0
         self.pan_y = 0
         self.last_mouse_pos = None
-
-        # Bind canvas interactions
-        self.canvas.bind("<Button-1>", self.add_seed_point)
-        self.canvas.bind("<MouseWheel>", self.zoom)
-        self.canvas.bind("<Button-2>", self.start_pan)
-        self.canvas.bind("<B2-Motion>", self.pan)
-        self.canvas.bind("<ButtonRelease-2>", self.reset_mouse_pos)
-
-        self.canvas.bind("<Configure>", self.on_resize)
-
-        # Bind mouse motion event to canvas
-        self.canvas.bind("<Motion>", self.show_mouse_coords)
-
+        self.viewport = None
         self.ocr_candidate_boxes = []
+        self.decimated_contour = None
+        self.decimated_epsilon = None
+        self.line_points = []
+        self.SCALE_FACTOR = None
+        self.PIXEL_SCALE = None
+        self.original_image = None
+        self.brown_line_mode = False
+        self.brown_line_points = []
+        self.brown_lines = []  # Store all brown lines as [(pt1, pt2), ...]
+        self.default_pdf_folder = os.path.expanduser("D:\temp\PlatsForTest")  # or set to your preferred default path
+        self.last_contour_distances = None
+        
 
-        # Autoload input.pdf on startup
-        self.autoload_pdf("input.pdf")
+        # --- Main layout ---
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_layout = QVBoxLayout(central)
 
-        self.decimated_contour = None  # Store simplified contour points
-        self.decimated_epsilon = None  # Store epsilon used for decimation
+        # --- Sliders frame above canvas ---
+        slider_layout = QHBoxLayout()
+        main_layout.addLayout(slider_layout)
 
-        # Ensure preview updates when slider moves
-        self.aggressiveness_slider.config(command=lambda v: self.update_preview())
+        self.aggressiveness_slider = self._make_slider("Aggressiveness", 0, 255, 25, self.on_aggressiveness_slider_changed)
+        slider_layout.addWidget(self.aggressiveness_slider['widget'])
+        slider_layout.addSpacing(20)
 
-        self.measure_button = Button(
-            self.button_frame,
-            text="Measure Distance",
-            command=self.enable_measure_mode
-        )
-        self.measure_button.pack()
+        self.pixel_slider = self._make_slider("Gap Pixels", 1, 50, 2)
+        slider_layout.addWidget(self.pixel_slider['widget'])
+        slider_layout.addSpacing(20)
 
-        # # Add regex pattern fields for OCR candidate extraction
-        # self.regex_frame = tk.Frame(self.button_frame)
-        # self.regex_frame.pack(pady=5)
+        self.contrast_slider = self._make_slider("Contrast", 0, 200, 100, self.on_contrast_slider_changed)
+        slider_layout.addWidget(self.contrast_slider['widget'])
+        slider_layout.addSpacing(20)
 
-        # tk.Label(self.regex_frame, text="Direction Regex:").pack(side=tk.LEFT)
-        # self.direction_regex_entry = Entry(self.regex_frame, width=20)
-        # self.direction_regex_entry.pack(side=tk.LEFT, padx=2)
-        # #self.direction_regex_entry.insert(0, r"^[NS].*[WE]$")
+        self.kernel_slider = self._make_slider("Kernel Size", 5, 100, 5, self.on_kernel_slider_changed)
+        slider_layout.addWidget(self.kernel_slider['widget'])
+        slider_layout.addSpacing(20)
 
-        # tk.Label(self.regex_frame, text="Distance Regex:").pack(side=tk.LEFT)
-        # self.distance_regex_entry = Entry(self.regex_frame, width=20)
-        # self.distance_regex_entry.pack(side=tk.LEFT, padx=2)
-        # self.distance_regex_entry.insert(0, r"\d{1,4}\.\d{1,3}\s?'")
+        self.lambda_slider = self._make_slider("Lambda", 0, 100, 0, self.update_canvas_image)
+        slider_layout.addWidget(self.lambda_slider['widget'])
+        slider_layout.addSpacing(20)
 
-        # Add contrast slider
-        self.contrast_slider = Scale(
-            self.button_frame,
-            from_=0.5, to=2.0,
-            resolution=0.01,
-            orient=tk.HORIZONTAL,
-            label="Contrast"
-        )
-        self.contrast_slider.set(1.0)
-        self.contrast_slider.pack()
+        self.simplify_slider = self._make_slider("Simplify Contour", 1, 100, 5, self.on_simplify_slider_changed)
+        slider_layout.addWidget(self.simplify_slider['widget'])
+        slider_layout.addSpacing(20)
 
-        # Ensure preview updates when slider moves
-        self.contrast_slider.config(command=lambda v: self.update_preview())
+        # --- Canvas below sliders ---
+        self.canvas = CanvasWidget()
+        self.canvas.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.MinimumExpanding)
+        #self.canvas.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed) # optinal fixed size
+        main_layout.addWidget(self.canvas)
 
-        # Add kernel size slider for morphological operations
-        self.kernel_slider = Scale(
-            self.button_frame,
-            from_=5, to=100,
-            orient=tk.HORIZONTAL,
-            label="Kernel Size"
-        )
-        self.kernel_slider.set(5)
-        self.kernel_slider.pack()
+        # --- Button row below canvas ---
+        button_layout = QHBoxLayout()
+        main_layout.addLayout(button_layout)
 
-    def autoload_pdf(self, filename):
-        import os
-        if os.path.exists(filename):
-            try:
-                dpi = 200
-                pages = convert_from_path(
-                    filename,
-                    dpi=dpi,
-                    poppler_path=r'C:\\Apps\\poppler-24.08.0\\Library\\bin'
-                )
-                pil_image = pages[0]
-                self.original_image = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
-                h, w = self.original_image.shape[:2]
-                self.viewport = Viewport(w, h, self.canvas_width, self.canvas_height)
-                self.image = self.original_image.copy()
-                self.seed_points.clear()
-                self.mask = None
-                self.fit_to_view()
-                print(f"Autoloaded {filename}")
-            except Exception as e:
-                print(f"Failed to autoload {filename}: {e}")
-        else:
-            print(f"File {filename} not found.")
+        self.load_button = QPushButton("1 - Load PDF")
+        self.load_button.clicked.connect(self.load_pdf)
+        button_layout.addWidget(self.load_button)
 
-    def on_resize(self, event):
-        self.canvas_width = event.width
-        self.canvas_height = event.height
-        if hasattr(self, 'viewport') and self.viewport:
-            self.viewport.canvas_width = event.width
-            self.viewport.canvas_height = event.height
-        self.update_preview()
+        self.clear_button = QPushButton("Clear Canvas")
+        self.clear_button.clicked.connect(self.clear_canvas)
+        button_layout.addWidget(self.clear_button)
 
-    def load_pdf(self):
-        file_path = filedialog.askopenfilename(filetypes=[("PDF Files", "*.pdf")])
-        if file_path:
-            dpi = 400
-            pages = convert_from_path(
-                file_path,
-                dpi=dpi,
-                poppler_path=r'C:\\Apps\\poppler-24.08.0\\Library\\bin'
-            )
-            pil_image = pages[0]
-            self.original_image = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+        self.fit_button = QPushButton("Fit to View")
+        self.fit_button.clicked.connect(self.fit_to_view)
+        button_layout.addWidget(self.fit_button)
 
-            h, w = self.original_image.shape[:2]
+        self.extract_button = QPushButton("3 - Extract Distances")
+        self.extract_button.clicked.connect(self.on_extract_distances_clicked)
+        button_layout.addWidget(self.extract_button)
 
-            # Initialize viewport
-            self.viewport = Viewport(w, h, self.canvas_width, self.canvas_height)
+        self.measure_button = QPushButton("Measure Distance")
+        self.measure_button.clicked.connect(self.enable_measure_mode)
+        button_layout.addWidget(self.measure_button)
 
-            self.image = self.original_image.copy()
-            self.seed_points.clear()
-            self.mask = None
-            self.fit_to_view()
+        self.simplify_contour_button = QPushButton("2 - Create Simplified Contour")
+        self.simplify_contour_button.clicked.connect(self.create_simplified_contour)
+        button_layout.addWidget(self.simplify_contour_button)
 
-    def add_seed_point(self, event):
-        if not hasattr(self, 'viewport') or self.viewport is None:
-            tk.messagebox.showwarning("Image Not Loaded", "Please load an image before adding seed points.")
+        self.export_geotiff_button = QPushButton("5 - Export GeoTIFF")
+        self.export_geotiff_button.clicked.connect(self.export_geotiff)
+        button_layout.addWidget(self.export_geotiff_button)
+
+        self.add_brown_line_button = QPushButton("Add Brown Line")
+        self.add_brown_line_button.clicked.connect(self.enable_brown_line_mode)
+        button_layout.addWidget(self.add_brown_line_button)
+
+        self.auto_contrast_button = QPushButton("Auto Contrast for OCR")
+        self.auto_contrast_button.clicked.connect(self.enable_auto_contrast_roi_mode)
+        button_layout.addWidget(self.auto_contrast_button)
+
+        # # --- Add OCR button ---
+        # self.ocr_button = QPushButton("OCR Along Contour")
+        # self.ocr_button.clicked.connect(self.ocr_along_contour)
+        # button_layout.addWidget(self.ocr_button)
+
+        # --- Bottom: Table, scale input, scale factor label ---
+        bottom_layout = QHBoxLayout()
+        main_layout.addLayout(bottom_layout)
+
+        # Centered distances table
+        table_layout = QVBoxLayout()
+        bottom_layout.addLayout(table_layout, stretch=2)
+
+        self.table_label = QLabel("Distances")
+        self.table_label.setAlignment(Qt.AlignCenter)
+        table_layout.addWidget(self.table_label)
+
+        self.table_text = QTextEdit()
+        self.table_text.setReadOnly(True)
+        self.table_text.setMinimumWidth(500)
+        table_layout.addWidget(self.table_text)
+
+        self.coord_label = QLabel("Mouse: (x, y)")
+        table_layout.addWidget(self.coord_label, alignment=Qt.AlignRight)
+
+        self.distance_label = QLabel("Measured Distance: N/A")
+        table_layout.addWidget(self.distance_label, alignment=Qt.AlignRight)
+
+        # Scale input (left)
+        scale_input_layout = QHBoxLayout()
+        bottom_layout.addLayout(scale_input_layout, stretch=1)
+        scale_input_layout.addWidget(QLabel("Real-world Distance (feet):"))
+        self.real_distance_entry = QLineEdit()
+        self.real_distance_entry.setFixedWidth(80)
+        scale_input_layout.addWidget(self.real_distance_entry)
+        self.calc_scale_button = QPushButton("4 - Calc Scale Factor")
+        self.calc_scale_button.clicked.connect(self.calculate_scale_factor)
+        scale_input_layout.addWidget(self.calc_scale_button)
+
+        # Scale factor label (right)
+        self.scale_factor_label = QLabel("Scale Factor: Not set")
+        self.scale_factor_label.setStyleSheet("color: blue;")
+        bottom_layout.addWidget(self.scale_factor_label, alignment=Qt.AlignRight)
+
+        # --- Canvas event connections ---
+        self.canvas.left_click.connect(self.add_seed_point)
+        self.canvas.right_click.connect(self.trace_line)
+        self.canvas.middle_press.connect(self.start_pan)
+        self.canvas.middle_move.connect(self.pan)
+        self.canvas.middle_release.connect(self.reset_mouse_pos)
+        self.canvas.mouse_wheel.connect(self.zoom)
+        self.canvas.mouse_move.connect(self.show_mouse_coords)
+        #self.canvas.resize_event.connect(self.on_resize)
+        #self.set_default_left_click()
+
+        # # --- Timer for resize handling ---
+        # self.resize_timer = QTimer(self)
+        # self.resize_timer.setSingleShot(True)
+        # self.resize_timer.timeout.connect(self.update_canvas_image)
+
+        self.aggressiveness_timer = QTimer(self)
+        self.aggressiveness_timer.setSingleShot(True)
+        self.aggressiveness_timer.timeout.connect(self.update_canvas_image)
+
+        self.contrast_timer = QTimer(self)
+        self.contrast_timer.setSingleShot(True)
+        self.contrast_timer.timeout.connect(self.update_canvas_image)
+
+        self.kernel_timer = QTimer(self)
+        self.kernel_timer.setSingleShot(True)
+        self.kernel_timer.timeout.connect(self.create_simplified_contour)
+
+        self.simplify_timer = QTimer(self)
+        self.simplify_timer.setSingleShot(True)
+        self.simplify_timer.timeout.connect(self.create_simplified_contour)
+
+    def _make_slider(self, label, minv, maxv, val, slot=None):
+        from PyQt5.QtWidgets import QVBoxLayout, QHBoxLayout, QWidget
+        w = QWidget()
+        l = QVBoxLayout(w)
+        l.setContentsMargins(0,0,0,0)
+        lab = QLabel(label)
+        lab.setAlignment(Qt.AlignCenter)
+        s = QSlider(Qt.Horizontal)
+        s.setMinimum(minv)
+        s.setMaximum(maxv)
+        s.setValue(val)
+        value_label = QLabel(str(val))
+        value_label.setAlignment(Qt.AlignCenter)
+       
+       # Layout: slider on top, label below, then value label below value label
+        l.addWidget(lab)
+        l.addWidget(s)
+        l.addWidget(value_label)
+
+        # Update value label on slider move
+        def update_value_label(v):
+            value_label.setText(str(v))
+            if slot:
+                slot()
+        s.valueChanged.connect(update_value_label)
+        return {'widget': w, 'slider': s, 'label': lab, 'value_label': value_label}
+
+    # --- Event Handlers (to be ported from Tkinter logic) ---
+
+    def add_seed_point(self, x, y):
+        if self.image is None:
             return
+        img_x, img_y = self.canvas_to_image_coords(x, y)
+        self.seed_points.append((img_x, img_y))  # Append instead of replace
+        print("Mask nonzero count:", np.count_nonzero(self.mask))
+        print("Seed points:", self.seed_points)
+        self.flood_fill_and_show_mask_contours()
 
-        x_canvas, y_canvas = event.x, event.y
-        x_img = int(self.viewport.offset_x + x_canvas / self.viewport.zoom)
-        y_img = int(self.viewport.offset_y + y_canvas / self.viewport.zoom)
+    def trace_line(self, x, y):
+        # Port your logic from Tkinter's trace_line here
+        pass
 
-        if self.image is not None:
-            h, w = self.image.shape[:2]
-            if 0 <= x_img < w and 0 <= y_img < h:
-                self.seed_points.append((x_img, y_img))
-                self.apply_flood_fill()
-                self.update_preview()
-                # Automatically run contour and gap fill after seed point
-                self.find_outer_contour()
-                self.recompute_contour_with_closing()
+    def start_pan(self, x, y):
+        # Port your logic from Tkinter's start_pan here
+        pass
 
-    def apply_flood_fill(self):
+    def pan(self, x, y):
+        # Port your logic from Tkinter's pan here
+        pass
+
+    def reset_mouse_pos(self):
+        # Port your logic from Tkinter's reset_mouse_pos here
+        pass
+
+    def flood_fill_and_show_mask_contours(self):
         if self.image is None or not self.seed_points:
+            print("No image or seed point.")
             return
 
-        flood_img = self.image.copy()
+        # 1. Flood fill to create mask
+        flood_img = self.original_image.copy()
         h, w = flood_img.shape[:2]
         mask = np.zeros((h + 2, w + 2), np.uint8)
-        aggressiveness = self.aggressiveness_slider.get()
 
+        mask[0, :] = 1
+        mask[-1, :] = 1
+        mask[:, 0] = 1
+        mask[:, -1] = 1
+
+        aggressiveness = self.aggressiveness_slider['slider'].value()
+
+        # --- Morphological operations to close gaps and thicken boundaries ---
+        # gray = cv2.cvtColor(flood_img, cv2.COLOR_BGR2GRAY)
+        # _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # kernel_size = self.kernel_slider['slider'].value()
+        # kernel = np.ones((kernel_size, kernel_size), np.uint8)
+        # closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+        # dilated = cv2.dilate(closed, kernel, iterations=1)
+        # flood_img = cv2.cvtColor(dilated, cv2.COLOR_GRAY2BGR)
+        # ---------------------------------------------------------------------
+
+        # Draw brown lines as barriers on the mask (before flood fill)
+        if hasattr(self, 'brown_lines'):
+            for pt1, pt2 in self.brown_lines:
+                pt1_mask = (pt1[0] + 1, pt1[1] + 1)
+                pt2_mask = (pt2[0] + 1, pt2[1] + 1)
+                cv2.line(mask, pt1_mask, pt2_mask, color=1, thickness=5)
+
+        # Accumulate mask for all seed points
         for point in self.seed_points:
             cv2.floodFill(
                 flood_img, mask, point, (255, 255, 255),
@@ -294,517 +340,457 @@ class FloodFillApp:
                 flags=cv2.FLOODFILL_MASK_ONLY | cv2.FLOODFILL_FIXED_RANGE
             )
 
-        # Remove border and scale mask for display
         mask = mask[1:-1, 1:-1]
-
-        # Use kernel size from slider for morphological closing
-        kernel_size = self.kernel_slider.get()
-        if kernel_size > 1:
-            kernel = np.ones((kernel_size, kernel_size), np.uint8)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
         if np.count_nonzero(mask) == 0:
             print("Flood fill did not mark any mask pixels. Try adjusting aggressiveness or seed point.")
-        self.mask = mask * 255
-
-    def update_preview(self):
-        if not hasattr(self, 'original_image') or self.original_image is None:
-            return
-        if not hasattr(self, 'viewport') or self.viewport is None:
             return
 
-        preview = self.viewport.get_view(self.original_image.copy())
+        # If a previous mask exists, accumulate (union) the new mask
+        if self.mask is not None and self.mask.shape == mask.shape:
+            self.mask = np.bitwise_or(self.mask, mask * 255)
+        else:
+            self.mask = mask * 255
+
+        # 2. Overlay mask on current image
+        overlay = self.original_image.copy()
+        overlay[self.mask > 0] = [0, 0, 255]  # Red overlay for mask
+        blended = cv2.addWeighted(self.original_image, 0.7, overlay, 0.3, 0)
+
+        # 3. Find contours in the mask and draw them on the overlay
+        mask_for_contours = (self.mask > 0).astype(np.uint8) * 255
+        contours, _ = cv2.findContours(mask_for_contours, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(blended, contours, -1, (0, 255, 0), 2)  # Green contours
+
+        self.image = blended
+        self.update_canvas_image()
+
+    def zoom(self, delta):
+        if self.image is None:
+            return
+
+        # Mouse wheel delta: positive = zoom in, negative = zoom out
+        # Typical delta is 120 per notch, so scale accordingly
+        factor = 1.1 if delta > 0 else 0.9
+
+        # Get mouse position on canvas (center if not available)
+        mouse_pos = self.canvas.mapFromGlobal(QCursor.pos())
+        mouse_x, mouse_y = mouse_pos.x(), mouse_pos.y()
+        canvas_w, canvas_h = self.canvas.width(), self.canvas.height()
+
+        # Image coordinates before zoom
+        img_h, img_w = self.image.shape[:2]
+        rel_x = (mouse_x - self.pan_x - (canvas_w - img_w * self.zoom_level) // 2) / self.zoom_level
+        rel_y = (mouse_y - self.pan_y - (canvas_h - img_h * self.zoom_level) // 2) / self.zoom_level
+
+        # Update zoom level, clamp to reasonable range
+        new_zoom = self.zoom_level * factor
+        min_zoom = min(canvas_w / img_w, canvas_h / img_h) * 0.1
+        max_zoom = 8.0
+        new_zoom = max(min_zoom, min(new_zoom, max_zoom))
+
+        # Adjust pan so the point under the mouse stays under the mouse
+        self.pan_x = int(mouse_x - rel_x * new_zoom - (canvas_w - img_w * new_zoom) // 2)
+        self.pan_y = int(mouse_y - rel_y * new_zoom - (canvas_h - img_h * new_zoom) // 2)
+        self.zoom_level = new_zoom
+
+        self.update_canvas_image()
+
+    def start_pan(self, x, y):
+        self.last_mouse_pos = (x, y)
+
+    def pan(self, x, y):
+        if self.last_mouse_pos is None:
+            return
+        dx = x - self.last_mouse_pos[0]
+        dy = y - self.last_mouse_pos[1]
+        self.pan_x += dx
+        self.pan_y += dy
+        self.last_mouse_pos = (x, y)
+        self.update_canvas_image()
+
+    def reset_mouse_pos(self):
+        self.last_mouse_pos = None
+
+    def show_mouse_coords(self, x, y):
+        # Convert widget (canvas) coordinates to image coordinates, considering pan and zoom
+        pass
+
+    def on_resize(self, width, height):
+        self.canvas_width = width
+        self.canvas_height = height
+        # Start/restart the timer (e.g., 200 ms delay)
+        # self.resize_timer.start(200)
+
+    def load_pdf(self):
+        # Open file dialog to select PDF
+        # file_path = r"D:\temp\PlatsForTest\PB0027_PG0048 - K-4716.pdf"
+        #------------------- comment above line and uncomment below for dialog--------------------
+
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open PDF",
+            self.default_pdf_folder,
+            "PDF Files (*.pdf)"
+)
+        if not file_path:
+            return
+
+        try:
+            import fitz  # PyMuPDF
+        except ImportError:
+            from PyQt5.QtWidgets import QMessageBox
+            QMessageBox.critical(self, "Missing Dependency", "PyMuPDF (fitz) is required to load PDFs.\nInstall with: pip install pymupdf")
+            return
+
+        # Load first page of PDF as image
+        doc = fitz.open(file_path)
+        if doc.page_count == 0:
+            return
+        page = doc.load_page(0)
+        pix = page.get_pixmap(dpi=200)  # 300 is a good starting point, can go higher
+        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape((pix.height, pix.width, pix.n))
+
+        if img.shape[2] == 4:
+            img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+
+        self.image = img
+        self.original_image = img.copy()
+        self.zoom_level = 0.5  # Set zoom to 50% on load
+        self.pan_x = 0
+        self.pan_y = 0
+        self.seed_points = []
+        self.mask = None
+       
+                # Auto-fit if image does not fit canvas
+        img_h, img_w = self.image.shape[:2]
+        canvas_w, canvas_h = self.canvas.width(), self.canvas.height()
+        if img_w > canvas_w or img_h > canvas_h:
+            self.fit_to_view()
+        else:
+            self.update_canvas_image()
+
+    def update_canvas_image(self):
+        if self.image is None:
+            return
 
         # Apply contrast adjustment
-        contrast = self.contrast_slider.get()
-        preview = cv2.convertScaleAbs(preview, alpha=contrast, beta=0)
+        contrast_value = self.contrast_slider['slider'].value()
+        alpha = contrast_value / 100.0  # 1.0 = original, <1.0 = less, >1.0 = more
+        display_img = cv2.convertScaleAbs(self.original_image, alpha=alpha, beta=0)
 
-        # Inverse correlation between aggressiveness and threshold
-        max_aggressiveness = self.aggressiveness_slider.cget("to")
-        min_threshold = 50
-        max_threshold = 150
-        aggressiveness = self.aggressiveness_slider.get()
-        threshold_value = int(max_threshold - (aggressiveness - 1) * (max_threshold - min_threshold) / (max_aggressiveness - 1))
+        # # If you have ROI boxes to show, overlay them here
+        # if self.ocr_candidate_boxes:
+        #     roi_overlay = self.create_roi_overlay(self.ocr_candidate_boxes, display_img.shape)
+        #     # Blend overlay with display image (alpha=0.7 for image, 0.3 for overlay)
+        #     display_img = cv2.addWeighted(display_img, 0.7, roi_overlay, 0.3, 0)
 
-        if threshold_value > 0:
-            gray = cv2.cvtColor(preview, cv2.COLOR_BGR2GRAY)
-            _, thresh_img = cv2.threshold(gray, threshold_value, 255, cv2.THRESH_BINARY)
-            preview = cv2.cvtColor(thresh_img, cv2.COLOR_GRAY2BGR)
+        # --- Overlay mask if it exists ---
+        if self.mask is not None and np.count_nonzero(self.mask) > 0:
+            mask_overlay = display_img.copy()
+            mask_overlay[self.mask > 0] = [0, 0, 255]
+            display_img = cv2.addWeighted(display_img, 0.7, mask_overlay, 0.3, 0)
 
-        # Apply mask if available
-        if self.mask is not None and self.mask.size > 0:
-            canvas_w = self.canvas.winfo_width()
-            canvas_h = self.canvas.winfo_height()
-            view_w = int(canvas_w / self.viewport.zoom)
-            view_h = int(canvas_h / self.viewport.zoom)
+            # Draw outer contours on top of mask overlay ONLY if no simplified contour
+            if self.decimated_contour is None:
+                mask_for_contours = (self.mask > 0).astype(np.uint8) * 255
+                contours, _ = cv2.findContours(mask_for_contours, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                cv2.drawContours(display_img, contours, -1, (0, 255, 0), 2)  # Green contours
 
-            x1 = int(round(self.viewport.offset_x))
-            y1 = int(round(self.viewport.offset_y))
-            x2 = min(x1 + view_w, self.mask.shape[1])
-            y2 = min(y1 + view_h, self.mask.shape[0])
-
-            # Ensure indices are within bounds
-            x1 = max(0, x1)
-            y1 = max(0, y1)
-            x2 = max(x1 + 1, x2)
-            y2 = max(y1 + 1, y2)
-
-            # Crop mask to viewport region
-            cropped_mask = self.mask[y1:y2, x1:x2]
-
-            # If cropped_mask shape doesn't match view_w/view_h, pad it
-            pad_h = view_h - cropped_mask.shape[0]
-            pad_w = view_w - cropped_mask.shape[1]
-            if pad_h > 0 or pad_w > 0:
-                cropped_mask = np.pad(
-                    cropped_mask,
-                    ((0, pad_h), (0, pad_w)),
-                    mode='constant',
-                    constant_values=0
-                )
-
-            # Resize mask to canvas size
-            if cropped_mask.size > 0:
-                resized_mask = cv2.resize(cropped_mask, (canvas_w, canvas_h), interpolation=cv2.INTER_NEAREST)
-                # Create a green mask overlay
-                green_overlay = np.zeros_like(preview)
-                green_overlay[:, :, 1] = 255  # Green channel
-
-                # Create alpha mask
-                alpha = (resized_mask == 255).astype(np.float32) * 0.4  # 0.4 = 40% opacity
-
-                # Blend preview and green overlay using alpha mask
-                for c in range(3):
-                    preview[:, :, c] = (preview[:, :, c] * (1 - alpha) + green_overlay[:, :, c] * alpha).astype(np.uint8)
-
-        # Draw seed points
-        for x, y in self.seed_points:
-            canvas_x = int((x - self.viewport.offset_x) * self.viewport.zoom)
-            canvas_y = int((y - self.viewport.offset_y) * self.viewport.zoom)
-            cv2.circle(preview, (canvas_x, canvas_y), radius=2, color=(0, 0, 255), thickness=-1)
-
-        # Draw outer contour if available
-        if hasattr(self, 'outer_contour') and self.outer_contour is not None:
-            for cnt in self.outer_contour:
-                transformed = np.array([
-                    [(pt[0] - self.viewport.offset_x) * self.viewport.zoom,
-                     (pt[1] - self.viewport.offset_y) * self.viewport.zoom]
-                    for pt in cnt.reshape(-1, 2)
-                ], dtype=np.int32)
-                cv2.drawContours(preview, [transformed], -1, (0, 0, 255), 2)
-
-        # Draw persistent OCR candidate bounding boxes in blue
-        if hasattr(self, 'ocr_candidate_boxes'):
-            for x_abs, y_abs, w_abs, h_abs, angle in self.ocr_candidate_boxes:
-                x1 = int((x_abs - self.viewport.offset_x) * self.viewport.zoom)
-                y1 = int((y_abs - self.viewport.offset_y) * self.viewport.zoom)
-                x2 = int((x_abs + w_abs - self.viewport.offset_x) * self.viewport.zoom)
-                y2 = int((y_abs + h_abs - self.viewport.offset_y) * self.viewport.zoom)
-                cv2.rectangle(preview, (x1, y1), (x2, y2), (255, 0, 0), 2)  # Blue
-
-        # Draw persistent decimated contour if present
+        # Draw simplified (decimated) contour if it exists
         if self.decimated_contour is not None:
-            # Transform decimated contour to viewport/canvas coordinates
-            transformed = np.array([
-                [(pt[0] - self.viewport.offset_x) * self.viewport.zoom,
-                 (pt[1] - self.viewport.offset_y) * self.viewport.zoom]
-                for pt in self.decimated_contour.reshape(-1, 2)
-            ], dtype=np.int32)
-            for i in range(len(transformed)):
-                pt1 = tuple(transformed[i])
-                pt2 = tuple(transformed[(i + 1) % len(transformed)])
-                cv2.line(preview, pt1, pt2, (255, 255, 0), 2)  # Cyan lines
-            # Draw best fit lines (blue) in viewport
-            for i in range(len(transformed)):
-                segment = [transformed[i], transformed[(i + 1) % len(transformed)]
-                ]
-                segment_np = np.array(segment, dtype=np.int32)
-                [vx, vy, x0, y0] = cv2.fitLine(segment_np, cv2.DIST_L2, 0, 0.01, 0.01)
-                length = 1000
-                x1 = int(x0 - vx * length)
-                y1 = int(y0 - vy * length)
-                x2 = int(x0 + vx * length)
-                y2 = int(y0 + vy * length)
-                cv2.line(preview, (x1, y1), (x2, y2), (255, 0, 0), 1)
+            cv2.drawContours(display_img, [self.decimated_contour], -1, (255, 0, 255), 2)  # Magenta
 
-        # Convert to Tkinter image
-        preview_rgb = cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
-        img_pil = Image.fromarray(preview_rgb)
-        self.tk_image = ImageTk.PhotoImage(img_pil)
-        self.canvas.delete("all")
-        self.canvas.create_image(0, 0, anchor=tk.NW, image=self.tk_image)
+        # Resize image to fit canvas, considering zoom and pan
+        h, w = display_img.shape[:2]
+        scale = self.zoom_level
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        resized = cv2.resize(display_img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
 
-    def save_mask(self):
-        if self.mask is None:
-            print("No mask available.")
-            return
+        # Create QImage and QPixmap
+        qimg = QImage(resized.data, resized.shape[1], resized.shape[0], resized.strides[0], QImage.Format_RGB888)
+        pixmap = QPixmap.fromImage(qimg.rgbSwapped())
 
-        # Apply morphological closing to fill small gaps
-        pixel_count = self.pixel_slider.get() if hasattr(self, 'pixel_slider') else 5
-        kernel = np.ones((pixel_count, pixel_count), np.uint8)
-        closed_mask = cv2.morphologyEx(self.mask, cv2.MORPH_CLOSE, kernel)
+        # Center or pan
+        canvas_w, canvas_h = self.canvas.width(), self.canvas.height()
+        display_pixmap = QPixmap(canvas_w, canvas_h)
+        display_pixmap.fill(QColor("#ddd"))
+        painter = None
+        try:
+            from PyQt5.QtGui import QPainter
+            painter = QPainter(display_pixmap)
+            x = (canvas_w - new_w) // 2 + self.pan_x
+            y = (canvas_h - new_h) // 2 + self.pan_y
+            painter.drawPixmap(x, y, pixmap)
+        finally:
+            if painter:
+                painter.end()
+        self.canvas.setPixmap(display_pixmap)
+        # Draw brown lines
+        if hasattr(self, 'brown_lines'):
+            painter = QPainter(self.canvas.pixmap())
+            # Use RGBA for semi-transparent brown (alpha=128 out of 255)
+            pen = QPen(QColor(150, 75, 0, 128))  # Brown, 50% transparent
+            pen.setWidth(12)  # Wider line
+            pen.setCapStyle(Qt.RoundCap)
+            painter.setPen(pen)
+            for pt1, pt2 in self.brown_lines:
+                x1, y1 = self.image_to_canvas_coords(*pt1)
+                x2, y2 = self.image_to_canvas_coords(*pt2)
+                painter.drawLine(x1, y1, x2, y2)
+            painter.end()
 
-        # Find outer contours from the closed mask
-        contours, _ = cv2.findContours(closed_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            print("No contours found.")
-            return
-
-        # Create a new mask with filled contour
-        h, w = closed_mask.shape
-        contour_mask = np.zeros((h, w), dtype=np.uint8)
-        cv2.drawContours(contour_mask, contours, -1, 255, thickness=cv2.FILLED)
-
-        # Convert to RGB for saving as JPEG
-        white_rgb = cv2.merge([contour_mask, contour_mask, contour_mask])
-        img_pil = Image.fromarray(white_rgb)
-
-        # Save to file
-        file_path = filedialog.asksaveasfilename(
-            defaultextension=".jpg",
-            filetypes=[("JPEG", "*.jpg")]
-        )
-        if file_path:
-            img_pil.save(file_path)
-            print(f"Mask saved to {file_path}")
+        # Draw scale segments (inliers/outsiders)
+        if hasattr(self, 'scale_segments'):
+            painter = QPainter(self.canvas.pixmap())
+            for pt1, pt2, is_inlier in self.scale_segments:
+                color = QColor(0, 200, 0, 200) if is_inlier else QColor(200, 0, 0, 200)  # Green for inlier, red for outlier
+                pen = QPen(color)
+                pen.setWidth(4)
+                pen.setCapStyle(Qt.RoundCap)
+                painter.setPen(pen)
+                x1, y1 = self.image_to_canvas_coords(*pt1)
+                x2, y2 = self.image_to_canvas_coords(*pt2)
+                painter.drawLine(x1, y1, x2, y2)
+            painter.end()
 
     def clear_canvas(self):
-        self.seed_points.clear()
-        self.mask = None            # Clear the mask
-        self.outer_contour = None   # Clear the outer contour
-        self.update_preview()
+        if hasattr(self, 'original_image') and self.original_image is not None:
+            self.image = self.original_image.copy()
+        self.found_contours = []
+        self.brown_lines = []  # Clear all brown lines
+        self.update_canvas_image()
 
-    def find_outer_contour(self):
-        if self.mask is None or self.original_image is None or self.viewport is None:
-            print("Mask or image not available.")
+    def fit_to_view(self):
+        if self.image is None:
             return
 
-        contours, _ = cv2.findContours(self.mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            return
-        self.outer_contour = contours  # Store all contours
-        contour_img = self.original_image.copy()
-        cv2.drawContours(contour_img, contours, -1, (0, 0, 255), 2)
+        img_h, img_w = self.image.shape[:2]
+        canvas_w, canvas_h = self.canvas.width(), self.canvas.height();
 
-        preview = self.viewport.get_view(contour_img)
+        # Calculate scale to fit image inside canvas
+        scale_x = canvas_w / img_w
+        scale_y = canvas_h / img_h
+        fit_scale = min(scale_x, scale_y)
 
-        preview_rgb = cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
-        img_pil = Image.fromarray(preview_rgb)
-        self.tk_image = ImageTk.PhotoImage(img_pil)
+        self.zoom_level = fit_scale
 
-        self.canvas.delete("all")
-        self.canvas.create_image(0, 0, anchor=tk.NW, image=self.tk_image)
+        # Center the image
+        new_w = int(img_w * fit_scale)
+        new_h = int(img_h * fit_scale)
+        self.pan_x = (canvas_w - new_w) // 2
+        self.pan_y = (canvas_h - new_h) // 2
 
-    def recompute_contour_with_closing(self):
-        if self.mask is None:
-            print("No mask available.")
-            return
+        self.update_canvas_image()
 
-        # Get pixel count from slider
-        pixel_count = self.pixel_slider.get()
-        kernel = np.ones((pixel_count, pixel_count), np.uint8)
+    def export_geotiff(self):
+        from PIL import Image, TiffImagePlugin
 
-        # Apply morphological closing to fill small gaps
-        closed_mask = cv2.morphologyEx(self.mask, cv2.MORPH_CLOSE, kernel)
-
-        # Find outer contours from the closed mask
-        contours, _ = cv2.findContours(closed_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            print("No contours found.")
+        if self.decimated_contour is None or self.original_image is None:
+            print("No simplified contour or image to export.")
             return
 
-        self.outer_contour = contours
+        # Create a blank mask
+        mask_shape = self.original_image.shape[:2]
+        contour_mask = np.zeros(mask_shape, dtype=np.uint8)
 
-        # Create a new mask using the filled contour
-        h, w = closed_mask.shape
-        new_mask = np.zeros((h + 2, w + 2), np.uint8)
-        for point in self.seed_points:
-            cv2.floodFill(self.original_image.copy(), new_mask, point, (255, 255, 255),
-                          (self.aggressiveness_slider.get(),) * 3, (self.aggressiveness_slider.get(),) * 3,
-                          flags=cv2.FLOODFILL_MASK_ONLY | cv2.FLOODFILL_FIXED_RANGE)
+        # Draw the simplified outer contour as a filled mask
+        cv2.drawContours(contour_mask, [self.decimated_contour], -1, color=255, thickness=cv2.FILLED)
 
-        self.mask = new_mask[1:-1, 1:-1] * 255
-        self.update_preview()
+        # Optionally, save as RGB for compatibility (white mask on black)
+        mask_rgb = cv2.cvtColor(contour_mask, cv2.COLOR_GRAY2RGB)
 
-    def sort_clockwise(self, points):
-        if not points:
-            return []
+        # Prepare EXIF data
+        exif_dict = TiffImagePlugin.ImageFileDirectory_v2()
+        # Store pixel scale in the official GeoTIFF tag 33550 (ModelPixelScaleTag)
+        exif_dict[33550] = (float(self.SCALE_FACTOR), float(self.SCALE_FACTOR), 0.0)
 
-        # Compute center of all points
-        cx = np.mean([pt[0] for _, pt in points])
-        cy = np.mean([pt[1] for _, pt in points])
+        # Save as GeoTIFF with EXIF
+        export_path = "Scaled_mask.tif"
+        pil_img = Image.fromarray(mask_rgb)
+        pil_img.save(export_path, tiffinfo=exif_dict)
+        print(f"GeoTIFF exported with mask and PixelScale EXIF: {export_path}")
 
-        def angle(p):
-            return np.arctan2(p[1] - cy, p[0] - cx)
+    def enable_measure_mode(self):
+        # Port your logic from Tkinter's enable_measure_mode here
+        pass
 
-        return sorted(points, key=lambda x: angle(x[1]))
-
-    def trace_line(self, event):
-        x_canvas, y_canvas = event.x, event.y
-        x_img = int(self.viewport.offset_x + x_canvas / self.viewport.zoom)
-        y_img = int(self.viewport.offset_y + y_canvas / self.viewport.zoom)
-
-        self.line_points.append((x_img, y_img))
-        self.canvas.create_oval(event.x-3, event.y-3, event.x+3, event.y+3, fill="cyan")
-
-        if len(self.line_points) == 2:
-            x1, y1 = self.line_points[0]
-            x2, y2 = self.line_points[1]
-            canvas_x1 = int((x1 - self.viewport.offset_x) * self.viewport.zoom)
-            canvas_y1 = int((y1 - self.viewport.offset_y) * self.viewport.zoom)
-            canvas_x2 = int((x2 - self.viewport.offset_x) * self.viewport.zoom)
-            canvas_y2 = int((y2 - self.viewport.offset_y) * self.viewport.zoom)
-            self.canvas.create_line(canvas_x1, canvas_y1, canvas_x2, canvas_y2, fill="cyan", width=2)
-            
     def calculate_scale_factor(self):
         self.line_points = []
+        # Use cached distances if available, otherwise extract
+        if self.last_contour_distances is not None:
+            contour_distances = self.last_contour_distances
+        else:
+            contour_distances = self.extract_text_along_decimated_lines()
+            self.last_contour_distances = contour_distances  # cache for future use
 
-        # Try to get array from extract_text_along_decimated_lines
-        contour_distances = self.extract_text_along_decimated_lines()
-        print("contour_distances:", contour_distances)
-        # Expected format: [(contour_number, real_distance_feet), ...]
+        if not contour_distances:
+            self.update_canvas_image()
+            return
+
         pixel_lengths = []
         real_distances_meters = []
+        for r in contour_distances:
+            pl = r["pixel_length"]
+            rd = r["distance_sum_feet"] * 0.3048
+            if pl > 0 and rd > 0:
+                pixel_lengths.append(pl)
+                real_distances_meters.append(rd)
 
-        if contour_distances:
-            # For each contour segment, get pixel length and real-world distance
-            for contour_number, real_distance_feet in contour_distances:
-                print(f"Contour {contour_number}: OCR feet={real_distance_feet}")
-                pt1 = self.decimated_contour[contour_number][0]
-                pt2 = self.decimated_contour[(contour_number + 1) % len(self.decimated_contour)][0]
-                pixel_length = math.hypot(pt2[0] - pt1[0], pt2[1] - pt1[1])
-                print(f"Pixel length: {pixel_length}")
-                print(f"Real distance (meters): {real_distance_feet * 0.3048}")
-                pixel_lengths.append(pixel_length)
-                real_distances_meters.append(real_distance_feet * 0.3048)
+        # Only use valid (nonzero) segments
+        valid_pairs = [(pl, rd) for pl, rd in zip(pixel_lengths, real_distances_meters) if rd > 0 and pl > 0]
+        if valid_pairs:
+            self.scale_segments = []  # List of (pt1, pt2, is_inlier)
+            pixel_lengths_valid, real_distances_valid = zip(*valid_pairs)
+            scale_factor, pixel_scale, inlier_mask = self.robust_scale_factor(pixel_lengths_valid, real_distances_valid)
+            if scale_factor is not None and pixel_scale is not None:
+                # Store segment info for visualization
+                for idx, (is_inlier, (pl, rd)) in enumerate(zip(inlier_mask, valid_pairs)):
+                    contour_number = idx
+                    pt1 = self.decimated_contour[contour_number][0]
+                    pt2 = self.decimated_contour[(contour_number + 1) % len(self.decimated_contour)][0]
+                    self.scale_segments.append((pt1, pt2, is_inlier))
+                self.SCALE_FACTOR = scale_factor
+                self.PIXEL_SCALE = pixel_scale
+                self.scale_factor_label.setText(
+                    f"Scale Factor: {self.SCALE_FACTOR:.4f} meters/pixel, Pixel Scale: {self.PIXEL_SCALE:.2f} pixels/meter"
+                )
+                print(f"Scale factor set to {self.SCALE_FACTOR:.4f} meters/pixel (robust, outliers omitted)")
+                print(f"Pixel scale set to {self.PIXEL_SCALE:.2f} pixels/meter")
+                # Optionally, print or mark which were inliers/outliers
+                print("Inlier mask:", inlier_mask)
+                return
+        self.update_canvas_image()
 
-            # Simple average: only use valid (nonzero) segments
-            valid_pairs = [(pl, rd) for pl, rd in zip(pixel_lengths, real_distances_meters) if rd > 0]
-            if valid_pairs:
-                pixel_lengths_valid, real_distances_valid = zip(*valid_pairs)
-                avg_pixel_length = sum(pixel_lengths_valid) / len(pixel_lengths_valid)
-                avg_real_distance = sum(real_distances_valid) / len(real_distances_valid)
-                if avg_real_distance > 0 and avg_pixel_length > 0:
-                    self.SCALE_FACTOR = avg_real_distance / avg_pixel_length  # meters per pixel
-                    self.PIXEL_SCALE = avg_pixel_length / avg_real_distance   # pixels per meter
-                    self.scale_factor_label.config(
-                        text=f"Scale Factor: {self.SCALE_FACTOR:.4f} meters/pixel, Pixel Scale: {self.PIXEL_SCALE:.2f} pixels/meter"
-                    )
-                    print(f"Scale factor set to {self.SCALE_FACTOR:.4f} meters/pixel")
-                    print(f"Pixel scale set to {self.PIXEL_SCALE:.2f} pixels/meter")
-                    return
+        # Fallback: manual input via two clicks and entry
+        from PyQt5.QtGui import QPainter, QPen
+        from PyQt5.QtCore import QPoint
 
-        # Fallback: manual input
-        def on_right_click(event):
-            x_canvas, y_canvas = event.x, event.y
-            x_img = int(self.viewport.offset_x + x_canvas / self.viewport.zoom)
-            y_img = int(self.viewport.offset_y + y_canvas / self.viewport.zoom)
-            self.line_points.append((x_img, y_img))
-            self.canvas.create_oval(event.x-3, event.y-3, event.x+3, event.y+3, fill="cyan")
+        self.statusBar().showMessage("Click two points on the image to define the scale line.")
+
+        def on_canvas_click(x, y):
+            img_x, img_y = self.canvas_to_image_coords(x, y)
+            self.line_points.append((img_x, img_y))
+
+            # Draw a small circle at the clicked point
+            pixmap = self.canvas.pixmap().copy()
+            qp = QPainter(pixmap)
+            pen = QPen(QColor("cyan"))
+            pen.setWidth(4)
+            qp.setPen(pen)
+            qp.drawEllipse(QPoint(x, y), 4, 4)
+            qp.end()
+            self.canvas.setPixmap(pixmap)
 
             if len(self.line_points) == 2:
+                # Disconnect after two points
+                self.canvas.left_click.disconnect(on_canvas_click)
                 x1, y1 = self.line_points[0]
                 x2, y2 = self.line_points[1]
-                canvas_x1 = int((x1 - self.viewport.offset_x) * self.viewport.zoom)
-                canvas_y1 = int((y1 - self.viewport.offset_y) * self.viewport.zoom)
-                canvas_x2 = int((x2 - self.viewport.offset_x) * self.viewport.zoom)
-                canvas_y2 = int((y2 - self.viewport.offset_y) * self.viewport.zoom)
-                self.canvas.create_line(canvas_x1, canvas_y1, canvas_x2, canvas_y2, fill="cyan", width=2)
 
+                # Draw the scale line
+                pixmap = self.canvas.pixmap().copy()
+                qp = QPainter(pixmap)
+                pen = QPen(QColor("cyan"))
+                pen.setWidth(2)
+                qp.setPen(pen)
+                # Convert image coords to canvas coords
+                def img_to_canvas_coords(ix, iy):
+                    canvas_w, canvas_h = self.canvas.width(), self.canvas.height()
+                    img_h, img_w = self.original_image.shape[:2]
+                    scale = self.zoom_level
+                    # this logic is intentional, do not change
+                    new_w = int(img_w * scale)
+                    new_h = int(img_h * scale)
+                    img_x0 = (canvas_w - new_w) // 2 + self.pan_x
+                    img_y0 = (canvas_h - new_h) // 2 + self.pan_y
+                    cx = int(ix * scale + img_x0)
+                    cy = int(iy * scale + img_y0)
+                    return cx, cy
+                cx1, cy1 = img_to_canvas_coords(x1, y1)
+                cx2, cy2 = img_to_canvas_coords(x2, y2)
+                qp.drawLine(cx1, cy1, cx2, cy2)
+                qp.end()
+                self.canvas.setPixmap(pixmap)
+
+                # Get real-world distance from input
                 try:
-                    real_distance_feet = float(self.real_distance_entry.get())
-                    print("Real-world distance is", real_distance_feet, " feet")
+                    real_distance_feet = float(self.real_distance_entry.text())
                 except ValueError:
-                    print("Invalid distance entered.")
+                    self.statusBar().showMessage("Invalid real-world distance entered.")
                     return
 
                 real_distance_meters = real_distance_feet * 0.3048
                 pixel_distance = math.hypot(x2 - x1, y2 - y1)
 
-                if real_distance_meters == 0:
-                    print("Real-world distance is zero.")
-                    return
-                if pixel_distance == 0:
-                    print("Pixel distance is zero.")
+                if real_distance_meters == 0 or pixel_distance == 0:
+                    self.statusBar().showMessage("Distances must be non-zero.")
                     return
 
                 self.SCALE_FACTOR = real_distance_meters / pixel_distance  # meters per pixel
                 self.PIXEL_SCALE = pixel_distance / real_distance_meters   # pixels per meter
 
-                self.scale_factor_label.config(
-                    text=f"Scale Factor: {self.SCALE_FACTOR:.4f} meters/pixel, Pixel Scale: {self.PIXEL_SCALE:.2f} pixels/meter"
+                self.scale_factor_label.setText(
+                    f"Scale Factor: {self.SCALE_FACTOR:.4f} meters/pixel, Pixel Scale: {self.PIXEL_SCALE:.2f} pixels/meter"
                 )
-                print(f"Scale factor set to {self.SCALE_FACTOR:.4f} meters/pixel")
-                print(f"Pixel scale set to {self.PIXEL_SCALE:.2f} pixels/meter")
+                self.statusBar().showMessage("Scale factor calculated.")
 
-                self.canvas.unbind("<Button-3>")
+        self.canvas.left_click.connect(on_canvas_click)
 
-        self.canvas.bind("<Button-3>", on_right_click)
-        print("Right-click two points on the canvas to define the scale line.")
+    def update_aggressiveness_value_label(self, v):
+        self.aggressiveness_slider['value_label'].setText(str(int(float(v))))
 
-    def show_mouse_coords(self, event):
-        # Canvas coordinates
-        x_canvas, y_canvas = event.x, event.y
+    def create_simplified_contour(self):
+        if self.mask is None or np.count_nonzero(self.mask) == 0:
+            return
 
-        # Image coordinates (if viewport exists)
-        if hasattr(self, 'viewport') and self.viewport is not None:
-            x_img = int(self.viewport.offset_x + x_canvas / self.viewport.zoom)
-            y_img = int(self.viewport.offset_y + y_canvas / self.viewport.zoom)
-            self.coord_label.config(text=f"Mouse: Canvas ({x_canvas}, {y_canvas})  Image ({x_img}, {y_img})")
+        # Apply morphological closing/opening with kernel size from slider
+        kernel_size = self.kernel_slider['slider'].value()
+        if kernel_size > 1:
+            kernel = np.ones((kernel_size, kernel_size), np.uint8)
+            mask_for_contours = cv2.morphologyEx(self.mask, cv2.MORPH_CLOSE, kernel)
         else:
-            self.coord_label.config(text=f"Mouse: Canvas ({x_canvas}, {y_canvas})")
+            mask_for_contours = self.mask.copy()
 
-    def export_geotiff(self):
-        if self.mask is None:
-            print("No mask available.")
-            return
-
-        if self.SCALE_FACTOR is None:
-            print("Scale factor not set.")
-            return
-
-        # Apply morphological closing to fill small gaps
-        pixel_count = self.pixel_slider.get() if hasattr(self, 'pixel_slider') else 5
-        kernel = np.ones((pixel_count, pixel_count), np.uint8)
-        closed_mask = cv2.morphologyEx(self.mask, cv2.MORPH_CLOSE, kernel)
-
-        # Find outer contours from the closed mask
-        contours, _ = cv2.findContours(closed_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if mask_for_contours.max() > 1:
+            mask_for_contours = (mask_for_contours > 0).astype(np.uint8) * 255
+        contours, _ = cv2.findContours(mask_for_contours, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
         if not contours:
-            print("No contours found.")
             return
 
-        # Create a new mask with filled contour
-        h, w = closed_mask.shape
-        contour_mask = np.zeros((h, w), dtype=np.uint8)
-        cv2.drawContours(contour_mask, contours, -1, 255, thickness=cv2.FILLED)
+        largest_contour = max(contours, key=cv2.contourArea)
+        slider_value = self.simplify_slider['slider'].value()  # 1-100
+        epsilon = (slider_value / 1000.0) * cv2.arcLength(largest_contour, True)  # 0.0010.1 * arcLength
+        simplified = cv2.approxPolyDP(largest_contour, epsilon, True)
 
-        # Prepare GeoTIFF pixel scale tag (ModelPixelScaleTag, tag 33550)
-        # Format: (tag, dtype, count, value, writeonce)
-        # For a 2D image, Z scale is usually 0
-        pixel_scale_tag = (33550, 'd', 3, [self.SCALE_FACTOR, self.SCALE_FACTOR, 0.0], False)
+        print(f"Original points: {len(largest_contour)}, Simplified: {len(simplified)}, Epsilon: {epsilon:.4f}, Kernel: {kernel_size}")
 
-        # Save as GeoTIFF with pixel scale EXIF data
-        file_path = filedialog.asksaveasfilename(defaultextension=".tif", filetypes=[("GeoTIFF", "*.tif")])
-        if file_path:
-            tifffile.imwrite(
-                file_path,
-                contour_mask,
-                extratags=[pixel_scale_tag]
-            )
-            print(f"GeoTIFF saved to {file_path} with ModelPixelScaleTag={self.SCALE_FACTOR} meters/pixel")
+        self.decimated_contour = simplified
 
-    def on_simplify_contour(self):
-        # Only use the current outer_contour, do not recompute
-        epsilon_ratio = self.simplify_slider.get()
-        self.overlay_simplified_contour(epsilon_ratio)
+        contour_img = self.original_image.copy()
+        cv2.drawContours(contour_img, [simplified], -1, (255, 0, 255), 2)
+        self.image = contour_img
+        self.update_canvas_image()          
 
-    def overlay_simplified_contour(self, epsilon_ratio=0.01):
-        if not hasattr(self, 'outer_contour') or self.outer_contour is None:
-            print("No outer contour available.")
-            return
-
-        # Use the largest contour from the existing outer_contour
-        contour = max(self.outer_contour, key=cv2.contourArea)
-        epsilon = epsilon_ratio * cv2.arcLength(contour, True)
-        approx = cv2.approxPolyDP(contour, epsilon, True)
-
-        # Trim at intersection of nearest neighbor
-        trimmed = self._trim_at_intersections(approx)
-
-        self.decimated_contour = trimmed
-        self.decimated_epsilon = epsilon_ratio
-
-        print(f"Simplified contour with epsilon={epsilon:.2f} ({epsilon_ratio*100:.2f}%) from {len(contour)} to {len(trimmed)} points.")
-
-        img = self.original_image.copy()
-        self._draw_decimated_contour(img)
-
-        preview = self.viewport.get_view(img)
-        preview_rgb = cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
-        img_pil = Image.fromarray(preview_rgb)
-        self.tk_image = ImageTk.PhotoImage(img_pil)
-        self.canvas.delete("all")
-        self.canvas.create_image(0, 0, anchor=tk.NW, image=self.tk_image)
-
-    def _trim_at_intersections(self, approx):
-        # Remove points that are too close to their neighbors (intersection/overlap)
-        if len(approx) < 3:
-            return approx
-        trimmed = []
-        min_dist = 5  # pixels, adjust as needed
-        for i in range(len(approx)):
-            pt = approx[i][0]
-            prev_pt = approx[i-1][0]
-            next_pt = approx[(i+1) % len(approx)][0]
-            dist_prev = np.linalg.norm(pt - prev_pt)
-            dist_next = np.linalg.norm(pt - next_pt)
-            # Keep if not too close to either neighbor
-            if dist_prev > min_dist and dist_next > min_dist:
-                trimmed.append([pt])
-        if len(trimmed) < 3:
-            # If too aggressive, fallback to original
-            return approx
-        return np.array(trimmed, dtype=np.int32)
-
-    def _draw_decimated_contour(self, img):
-        if self.decimated_contour is not None:
-            approx = self.decimated_contour
-            for i in range(len(approx)):
-                pt1 = tuple(approx[i][0])
-                pt2 = tuple(approx[(i + 1) % len(approx)][0])
-                cv2.line(img, pt1, pt2, (255, 255, 0), 2)  # Cyan lines
-            for i in range(len(approx)):
-                segment = [approx[i][0], approx[(i + 1) % len(approx)][0]]
-                segment_np = np.array(segment, dtype=np.int32)
-                [vx, vy, x0, y0] = cv2.fitLine(segment_np, cv2.DIST_L2, 0, 0.01, 0.01)
-                length = 100
-                x1 = int(x0 - vx * length)
-                y1 = int(y0 - vy * length)
-                x2 = int(x0 + vx * length)
-                y2 = int(y0 + vy * length)
-                cv2.line(img, (x1, y1), (x2, y2), (255, 0, 0), 1)
-        
-    def export_decmask_image(self):
-        # Compose the onscreen overlay as seen in update_preview
-        if not hasattr(self, 'original_image') or self.original_image is None:
-            print("No image loaded.")
-            return
-
-        img = self.original_image.copy()
-
-        # Overlay mask in green
-        if self.mask is not None and self.mask.size > 0:
-            mask_rgb = cv2.merge([self.mask, self.mask, self.mask])
-            green_mask = np.zeros_like(mask_rgb)
-            green_mask[:, :, 1] = mask_rgb[:, :, 1]
-            img = cv2.addWeighted(img, 1.0, green_mask, 0.4, 0)
-
-        # Overlay outer contour in red
-        if hasattr(self, 'outer_contour') and self.outer_contour is not None:
-            cv2.drawContours(img, self.outer_contour, -1, (0, 0, 255), 2)
-
-        # Overlay decimated contour in cyan and best fit lines in blue
-        if self.decimated_contour is not None:
-            approx = self.decimated_contour
-            for i in range(len(approx)):
-                pt1 = tuple(approx[i][0])
-                pt2 = tuple(approx[(i + 1) % len(approx)][0])
-                cv2.line(img, pt1, pt2, (255, 255, 0), 2)  # Cyan lines
-            for i in range(len(approx)):
-                segment = [approx[i][0], approx[(i + 1) % len(approx)][0]]
-                segment_np = np.array(segment, dtype=np.int32)
-                [vx, vy, x0, y0] = cv2.fitLine(segment_np, cv2.DIST_L2, 0, 0.01, 0.01)
-                length = 1000
-                x1 = int(x0 - vx * length)
-                y1 = int(y0 - vy * length)
-                x2 = int(x0 + vx * length)
-                y2 = int(y0 + vy * length)
-                cv2.line(img, (x1, y1), (x2, y2), (255, 0, 0), 1)  # Blue lines
-
-        # Save as PNG
-        cv2.imwrite("DecMaskImage.png", img)
-        print("Exported DecMaskImage.png")
+    def canvas_to_image_coords(self, x, y):
+        """Convert canvas (widget) coordinates to image coordinates, considering pan and zoom."""
+        canvas_w, canvas_h = self.canvas.width(), self.canvas.height()
+        img_h, img_w = self.original_image.shape[:2]
+        scale = self.zoom_level
+        #do not modify this line - intentional logic
+        new_w = int(img_w * scale)
+        new_h = int(img_h * scale)
+        # Do not modify this line — intentional logic
+        # Calculate top-left of image in canvas 
+        img_x0 = (canvas_w - new_w) // 2 + self.pan_x
+        img_y0 = (canvas_h - new_h) // 2 + self.pan_y
+        # Convert canvas to image coordinates
+        img_x = int((x - img_x0) / scale)
+        img_y = int((y - img_y0) / scale)
+        # Clamp to image bounds
+        img_x = np.clip(img_x, 0, img_w - 1)
+        img_y = np.clip(img_y, 0, img_h - 1)
+        return img_x, img_y
 
     @staticmethod
     def preprocess_roi_for_ocr(roi):
@@ -852,7 +838,7 @@ class FloodFillApp:
 
         img = self.image.copy()
         contour = self.decimated_contour
-        line_width = 100
+        line_width = 200
         results = []
 
         # Use the largest contour for distance calculation
@@ -907,243 +893,380 @@ class FloodFillApp:
                 if roi.size == 0 or roi.shape[0] < 5 or roi.shape[1] < 5:
                     continue
 
-                # OCR: extract text from ROI (normal)
-                ocr_text = pytesseract.image_to_string(roi, config="--psm 6").strip()
-                # OCR: extract text from ROI (inverted)
+                # Save ROI image for review before OCR
+                roi_save_dir = "roi_review"
+                os.makedirs(roi_save_dir, exist_ok=True)
+                roi_filename = os.path.join(roi_save_dir, f"roi_segment_{i}.png")
+                cv2.imwrite(roi_filename, roi)
+
+                # --- Preprocess ROI before OCR ---
+                #roi_proc = self.preprocess_roi_for_ocr(roi)
+                #comment out above line and use below line to skip preprocessing
+                roi_proc = roi
+                ocr_text = pytesseract.image_to_string(roi_proc, config="--psm 6").strip()
+
                 roi_inverted = cv2.rotate(roi, cv2.ROTATE_180)
-                ocr_text_inverted = pytesseract.image_to_string(roi_inverted, config="--psm 6").strip()
+                #roi_inverted_proc = self.preprocess_roi_for_ocr(roi_inverted)
+                #comment out above line and use below line to skip preprocessing for inverted
+                roi_inverted_proc = roi_inverted
+                ocr_text_inverted = pytesseract.image_to_string(roi_inverted_proc, config="--psm 6").strip()
+                # ----------------------------------
 
-                print("Normal OCR:", ocr_text)
-                print("Inverted OCR:", ocr_text_inverted)
-
-                # Combine results
                 all_texts = [ocr_text, ocr_text_inverted]
                 number_matches = []
                 for text in all_texts:
                     number_matches += re.findall(r"\d{1,4}(?:\.\d{1,3})?\s*['\"]?", text)
-                print(number_matches)
-                # Convert to float (ignore non-numeric)
                 distances = []
                 for match in number_matches:
-                    # Remove non-numeric characters except dot
                     num_str = re.sub(r"[^\d.]", "", match)
-                    print(num_str)
-                   
                     if '.' in num_str:
                         try:
                             distances.append(float(num_str))
                         except ValueError:
                             continue
-                    else:
-                        pass
-
                 distance_sum = sum(distances) if distances else 0.0
-                print(".")
-                print(distance_sum)
-                results.append([i, distance_sum])
+                results.append({
+                    "index": i,
+                    "distance_sum_feet": distance_sum,
+                    "pt1": pt1,
+                    "pt2": pt2,
+                    "pixel_length": math.hypot(pt2[0] - pt1[0], pt2[1] - pt1[1])
+                })
 
             except Exception as e:
                 print(f"Exception on line {i}: {e}")
                 continue
 
-        # Display results in the table at bottom right
-        self.table_text.delete("1.0", tk.END)
+        # Display results in the Qt table_text widget
+        self.table_text.clear()
         if results:
-            for idx, distance_sum in results:
-                self.table_text.insert(tk.END, f"Contour {idx}: Distance sum = {distance_sum:.2f}\n")
+            for result in results:
+                self.table_text.append(f"Contour {result['index']}: Distance sum = {result['distance_sum_feet']:.2f}")
         else:
-            self.table_text.insert(tk.END, "No distances found along decimated contour lines.\n")
+            self.table_text.append("No distances found along decimated contour lines.")
 
         # Append scale factor to the table
         if self.SCALE_FACTOR is not None:
-            self.table_text.insert(tk.END, f"\nScale Factor: {self.SCALE_FACTOR:.4f} meters/pixel\n")
+            self.table_text.append(f"\nScale Factor: {self.SCALE_FACTOR:.4f} meters/pixel")
         else:
-            self.table_text.insert(tk.END, "\nScale Factor: Not set\n")
+            self.table_text.append("\nScale Factor: Not set")
 
         return results if results else None
-        
-    def zoom(self, event):
-        MAX_ZOOM_LEVEL = 1.0  # Maximum zoom level for 1:1 pixel ratio
-        if self.original_image is None or self.viewport is None:
-            return
 
-        # Determine zoom direction
-        if hasattr(event, 'delta'):
-            # Windows scroll direction
-            factor = 1.1 if event.delta > 0 else 0.9  # Scroll forward = zoom in
-            # Linux scroll direction
-        elif event.num == 4:  # Linux scroll up
-            factor = 1.1  # Zoom in
-        elif event.num == 5:  # Linux scroll down
-            factor = 0.9  # Zoom out
-        else:
-            return
+    def Distance_find(self, ocr_results):
+        """
+        Sum all distances and update GUI.
+        Returns: total_distance, array of all distances
+        """
+        all_distances = []
+        for r in ocr_results:
+            all_distances.extend(r["distances"])
+        total_distance = sum(all_distances)
+        self.distance_label.setText(f"Measured Distance: {total_distance:.2f}")
+        self.distance_candidates = all_distances
+        return total_distance, all_distances
+    
+    def create_roi_overlay(self, roi_boxes, image_shape):
+        """
+        Draws ROI boxes as overlays for display.
+        roi_boxes: list of np.int32 corner arrays
+        image_shape: shape of the image to overlay on
+        Returns: overlay image
+        """
+        overlay = np.zeros(image_shape, dtype=np.uint8)
+        for box in roi_boxes:
+            cv2.polylines(overlay, [box], isClosed=True, color=(0, 255, 255), thickness=2)
+        return overlay
 
-        # Get mouse position on canvas
-        mouse_x, mouse_y = event.x, event.y
+    def sort_clockwise(self, points):
+        if not points:
+            return []
 
-        # Convert canvas coordinates to image coordinates
-        img_x = self.viewport.offset_x + mouse_x / self.viewport.zoom
-        img_y = self.viewport.offset_y + mouse_y / self.viewport.zoom
+        # Compute center of all points
+        cx = np.mean([pt[0] for _, pt in points])
+        cy = np.mean([pt[1] for _, pt in points])
 
-        fit_scale = min(self.canvas_width / self.original_image.shape[1],
-                        self.canvas_height / self.original_image.shape[0])
-        new_zoom = self.viewport.zoom * factor
-        new_zoom = max(fit_scale, min(new_zoom, MAX_ZOOM_LEVEL))
+        def angle(p):
+            return np.arctan2(p[1] - cy, p[0] - cx)
 
-        # Only update if zoom changed
-        if new_zoom != self.viewport.zoom:
-            self.viewport.offset_x = img_x - mouse_x / new_zoom
-            self.viewport.offset_y = img_y - mouse_y / new_zoom
-            self.viewport.zoom = new_zoom
-            self.update_preview()
-
-    def pan(self, event):
-        if self.last_mouse_pos:
-            dx = event.x - self.last_mouse_pos[0]
-            dy = event.y - self.last_mouse_pos[1]
-
-            # Move viewport in same direction as mouse
-            self.viewport.offset_x -= dx / self.viewport.zoom
-            self.viewport.offset_y -= dy / self.viewport.zoom
-
-            # Ensure offsets stay within bounds
-            self.viewport.offset_x = max(0, min(
-                self.viewport.offset_x,
-                self.viewport.image_width - self.canvas.winfo_width() / self.viewport.zoom
-            ))
-            self.viewport.offset_y = max(0, min(
-                self.viewport.offset_y,
-                self.viewport.image_height - self.canvas.winfo_height() / self.viewport.zoom
-            ))
-
-            self.update_preview()
-
-        self.last_mouse_pos = (event.x, event.y)
+        return sorted(points, key=lambda x: angle(x[1]))
   
-    def reset_mouse_pos(self, event):
-        self.last_mouse_pos = None
-    
-    def start_pan(self, event):
-        self.last_mouse_pos = (event.x, event.y)
-    
-    def start_measure(self, event):
-        # Get image coordinates from canvas coordinates
-        x_canvas, y_canvas = event.x, event.y
-        x_img = int(self.viewport.offset_x + x_canvas / self.viewport.zoom)
-        y_img = int(self.viewport.offset_y + y_canvas / self.viewport.zoom)
+    def enable_brown_line_mode(self):
+        self.brown_line_mode = True
+        self.brown_line_points = []
+        self.statusBar().showMessage("Brown line mode: Click two points to add a brown line (snaps to nearest contour).")
+        self.canvas.left_click.disconnect()
+        self.canvas.left_click.connect(self.brown_line_click)
+        self.canvas.mouse_move.connect(self.brown_line_mouse_move)
 
-        if not hasattr(self, 'measure_points'):
-            self.measure_points = []
-        self.measure_points.append((x_img, y_img))
-        self.canvas.create_oval(event.x-3, event.y-3, event.x+3, event.y+3, fill="magenta")
+    def brown_line_click(self, x, y):
+        img_x, img_y = self.canvas_to_image_coords(x, y)
+        snap_x, snap_y = self.snap_to_nearest_contour((img_x, img_y))
+        self.brown_line_points.append((snap_x, snap_y))
+        if len(self.brown_line_points) == 1:
+            # Draw blue snap indicator
+            self.draw_snap_indicator((snap_x, snap_y))
+        elif len(self.brown_line_points) == 2:
+            # Add the brown line
+            self.brown_lines.append(tuple(self.brown_line_points))
+            self.brown_line_mode = False
+            self.statusBar().showMessage("Brown line added.")
+            self.brown_line_points = []
+            self.update_canvas_image()
+            # Restore normal left click
+            self.set_default_left_click()
+            self.canvas.mouse_move.disconnect(self.brown_line_mouse_move)
 
-        if len(self.measure_points) == 2:
-            x1, y1 = self.measure_points[0]
-            x2, y2 = self.measure_points[1]
-            # Draw line
-            canvas_x1 = int((x1 - self.viewport.offset_x) * self.viewport.zoom)
-            canvas_y1 = int((y1 - self.viewport.offset_y) * self.viewport.zoom)
-            canvas_x2 = int((x2 - self.viewport.offset_x) * self.viewport.zoom)
-            canvas_y2 = int((y2 - self.viewport.offset_y) * self.viewport.zoom)
-            self.canvas.create_line(canvas_x1, canvas_y1, canvas_x2, canvas_y2, fill="magenta", width=2)
-
-            # Calculate pixel distance
-            pixel_distance = math.hypot(x2 - x1, y2 - y1)
-            # Convert to scaled units if scale factor is set
-            if self.SCALE_FACTOR:
-                scaled_distance = pixel_distance * self.SCALE_FACTOR
-                self.distance_label.config(
-                    text=f"Measured Distance: {pixel_distance:.2f} px, {scaled_distance:.2f} meters",
-                    fg="green"
-                )
-            else:
-                self.distance_label.config(
-                    text=f"Measured Distance: {pixel_distance:.2f} px",
-                    fg="green"
-                )
-
-            # Reset for next measurement
-            self.measure_points = []
-
-    def fit_to_view(self):
-        if self.original_image is None or self.viewport is None:
+    def brown_line_mouse_move(self, x, y):
+        if not self.brown_line_mode or len(self.brown_line_points) >= 2:
             return
-        h, w = self.original_image.shape[:2]
-        scale_x = self.canvas_width / w
-        scale_y = self.canvas_height / h
-        fit_scale = min(scale_x, scale_y)
-        self.viewport.zoom = fit_scale
-        self.viewport.offset_x = (w - self.canvas_width / fit_scale) / 2
-        self.viewport.offset_y = (h - self.canvas_height / fit_scale) / 2
-        self.update_preview()
+        img_x, img_y = self.canvas_to_image_coords(x, y)
+        snap_x, snap_y = self.snap_to_nearest_contour((img_x, img_y))
+        self.draw_snap_indicator((snap_x, snap_y))
 
-    def reset_zoom(self):
-        if self.viewport is None:
-            return
-        self.viewport.zoom = 1.0
-        self.viewport.offset_x = (self.viewport.image_width - self.canvas_width) / 2
-        self.viewport.offset_y = (self.viewport.image_height - self.canvas_height) / 2
-        self.update_preview()
+    def snap_to_nearest_contour(self, pt):
+        # Snap to nearest point on any contour (decimated_contour)
+        if self.decimated_contour is None:
+            return pt
+        contour = self.decimated_contour.reshape(-1, 2)
+        dists = np.linalg.norm(contour - np.array(pt), axis=1)
+        idx = np.argmin(dists)
+        return tuple(contour[idx])
 
-    def enable_measure_mode(self):
-        # Unbind previous right-click actions if any
-        self.canvas.unbind("<Button-3>")
-        # Bind right-click to start_measure
-        self.canvas.bind("<Button-3>", self.start_measure)
-        self.distance_label.config(text="Measured Distance: N/A")
- 
+    def draw_snap_indicator(self, pt):
+        # Draw a blue circle at pt on the canvas, with larger radius and thinner outline
+        self.update_canvas_image()  # Redraw base image and lines
+        pixmap = self.canvas.pixmap().copy()
+        from PyQt5.QtGui import QPainter, QPen
+        from PyQt5.QtCore import QPoint
+        qp = QPainter(pixmap)
+        pen = QPen(QColor("blue"))
+        pen.setWidth(4)  # Thinner outline
+        qp.setPen(pen)
+        canvas_x, canvas_y = self.image_to_canvas_coords(pt[0], pt[1])
+        qp.drawEllipse(QPoint(canvas_x, canvas_y), 12, 12)  # Larger radius
+        qp.end()
+        self.canvas.setPixmap(pixmap)
+            # Optionally highlight the nearest segment
+        if self.decimated_contour is not None:
+            contour = self.decimated_contour.reshape(-1, 2)
+            dists = np.linalg.norm(contour - np.array(pt), axis=1)
+            idx = np.argmin(dists)
+            pt1 = contour[idx]
+            pt2 = contour[(idx + 1) % len(contour)]
+            pen_line = QPen(QColor("blue"))
+            pen_line.setWidth(2)
+            qp.setPen(pen_line)
+            x1, y1 = self.image_to_canvas_coords(pt1[0], pt1[1])
+            x2, y2 = self.image_to_canvas_coords(pt2[0], pt2[1])
+            qp.drawLine(x1, y1, x2, y2)
 
-class Viewport:
-    def __init__(self, image_width, image_height, canvas_width, canvas_height):
-        self.image_width = image_width
-        self.image_height = image_height
-        self.canvas_width = canvas_width
-        self.canvas_height = canvas_height
-        self.zoom = 1.0
-        self.offset_x = 0
-        self.offset_y = 0
+    def image_to_canvas_coords(self, img_x, img_y):
+        # Inverse of canvas_to_image_coords
+        canvas_w, canvas_h = self.canvas.width(), self.canvas.height()
+        img_h, img_w = self.original_image.shape[:2]
+        scale = self.zoom_level
+        new_w = int(img_w * scale)
+        new_h = int(img_h * scale)
+        img_x0 = (canvas_w - new_w) // 2 + self.pan_x
+        img_y0 = (canvas_h - new_h) // 2 + self.pan_y
+        canvas_x = int(img_x * scale + img_x0)
+        canvas_y = int(img_y * scale + img_y0)
+        return canvas_x, canvas_y
 
-    def get_view(self, image):
-        view_w = int(self.canvas_width / self.zoom)
-        view_h = int(self.canvas_height / self.zoom)
+    def robust_scale_factor(self, pixel_lengths, real_distances_meters):
+        """
+        Robustly calculate scale factor (meters per pixel) using least squares and outlier rejection.
+        Returns: scale_factor, pixel_scale, inlier_mask
+        """
+        import numpy as np
+        pixel_lengths = np.array(pixel_lengths)
+        real_distances_meters = np.array(real_distances_meters)
+        if len(pixel_lengths) < 2 or len(real_distances_meters) < 2:
+            return None, None, None
 
-        x1 = int(self.offset_x)
-        y1 = int(self.offset_y)
-        x2 = x1 + view_w
-        y2 = y1 + view_h
+        # Linear fit: real_distance = scale_factor * pixel_length
+        A = np.vstack([pixel_lengths, np.ones(len(pixel_lengths))]).T
+        result = np.linalg.lstsq(A, real_distances_meters, rcond=None)
+        scale_factor, intercept = result[0]
 
-        # Create a blank canvas (white background)
-        canvas = np.ones((view_h, view_w, 3), dtype=np.uint8) * 255
+        # Calculate residuals
+        predicted = scale_factor * pixel_lengths + intercept
+        residuals = real_distances_meters - predicted
+        std_res = np.std(residuals)
 
-        # Compute image region to copy
-        img_x1 = max(0, x1)
-        img_y1 = max(0, y1)
-        img_x2 = min(x2, self.image_width)
-        img_y2 = min(y2, self.image_height)
+        # Identify inliers (within 2 standard deviations)
+        inlier_mask = np.abs(residuals) < 2 * std_res
 
-        # Compute where to paste it on the canvas
-        paste_x1 = max(0, -x1)
-        paste_y1 = max(0, -y1)
-        paste_x2 = paste_x1 + (img_x2 - img_x1)
-        paste_y2 = paste_y1 + (img_y2 - img_y1)
-
-        # Copy image region into canvas
-        canvas[paste_y1:paste_y2, paste_x1:paste_x2] = image[img_y1:img_y2, img_x1:img_x2]
-
-        # Resize to canvas size
-        resized = cv2.resize(canvas, (self.canvas_width, self.canvas_height), interpolation=cv2.INTER_AREA)
-        return resized
-
-    def preprocess_for_dashed_lines(image, dash_gap_size=10, orientation='horizontal'):
-        if orientation == 'horizontal':
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (dash_gap_size, 1))
+        # Refit using only inliers
+        if np.sum(inlier_mask) >= 2:
+            A_in = np.vstack([pixel_lengths[inlier_mask], np.ones(np.sum(inlier_mask))]).T
+            result_in = np.linalg.lstsq(A_in, real_distances_meters[inlier_mask], rcond=None)
+            scale_factor, intercept = result_in[0]
+            pixel_scale = 1.0 / scale_factor if scale_factor != 0 else None
         else:
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, dash_gap_size))
-        return cv2.morphologyEx(image, cv2.MORPH_CLOSE, kernel)
+            pixel_scale = None
 
+        return scale_factor, pixel_scale, inlier_mask
+
+    def on_aggressiveness_slider_changed(self):
+        # Restart the timer every time the slider value changes
+        self.aggressiveness_timer.start(200)
+
+    def on_contrast_slider_changed(self):
+        self.contrast_timer.start(200)
+
+    def on_kernel_slider_changed(self):
+        self.kernel_timer.start(200)
+
+    def on_simplify_slider_changed(self):
+        self.simplify_timer.start(200)
+
+    def find_best_contrast_for_ocr(self, roi=None, contrast_range=None):
+        """
+        Try different contrast settings and pick the one that gives the best OCR result.
+        roi: region of interest (numpy array). If None, use the whole original image.
+        contrast_range: list or range of contrast values to try (default: 60 to 180).
+        Returns: best_contrast, best_text, best_score
+        """
+        if roi is None:
+            roi = self.original_image
+        if contrast_range is None:
+            contrast_range = range(60, 181, 10)  # Try values from 60 to 180
+
+        best_score = -1
+        best_contrast = None
+        best_text = ""
+        for contrast in contrast_range:
+            alpha = contrast / 100.0
+            enhanced = cv2.convertScaleAbs(roi, alpha=alpha, beta=0)
+            # Preprocess for OCR if needed
+            gray = cv2.cvtColor(enhanced, cv2.COLOR_BGR2GRAY) if len(enhanced.shape) == 3 else enhanced
+            text = pytesseract.image_to_string(gray, config="--psm 6")
+            # Score: count number of digits found (or use another metric)
+            score = len(re.findall(r"\d", text))
+            if score > best_score:
+                best_score = score
+                best_contrast = contrast
+                best_text = text
+        return best_contrast, best_text, best_score
+
+    def auto_contrast_for_ocr(self):
+        best_contrast, best_text, best_score = self.find_best_contrast_for_ocr()
+        if best_contrast is not None:
+            self.contrast_slider['slider'].setValue(best_contrast)
+            self.statusBar().showMessage(f"Best contrast for OCR: {best_contrast} (score: {best_score})")
+            print("Best OCR text sample:", best_text)
+        else:
+            self.statusBar().showMessage("Auto contrast failed to find a better setting.")
+
+    def enable_auto_contrast_roi_mode(self):
+        self.statusBar().showMessage("Click near a contour segment to select ROI for auto contrast.")
+        try:
+            self.canvas.left_click.disconnect(self.add_seed_point)
+        except Exception:
+            pass
+        self.canvas.left_click.connect(self.auto_contrast_roi_pick)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if getattr(self, 'roi_selecting', False) and hasattr(self, 'roi_start') and hasattr(self, 'roi_end'):
+            painter = QPainter(self)
+            pen = QPen(QColor(255, 255, 0, 128))  # Semi-transparent yellow
+            pen.setWidth(2)
+            painter.setPen(pen)
+            x1, y1 = self.roi_start
+            x2, y2 = self.roi_end
+            painter.drawRect(min(x1, x2), min(y1, y2), abs(x2 - x1), abs(y2 - y1))
+            painter.end()
+    def auto_contrast_roi_pick(self, x, y):
+        img_x, img_y = self.canvas_to_image_coords(x, y)
+        if self.decimated_contour is None:
+            self.statusBar().showMessage("No contour available.")
+            return
+
+        contour = self.decimated_contour.reshape(-1, 2)
+        # Find nearest segment
+        min_dist = float('inf')
+        nearest_idx = 0
+        for i in range(len(contour)):
+            pt1 = contour[i]
+            pt2 = contour[(i + 1) % len(contour)]
+            v = np.array(pt2) - np.array(pt1)
+            w = np.array([img_x, img_y]) - np.array(pt1)
+            if np.dot(v, v) == 0:
+                proj = pt1
+            else:
+                t = np.clip(np.dot(w, v) / np.dot(v, v), 0, 1)
+                proj = pt1 + t * v
+            dist = np.linalg.norm(np.array([img_x, img_y]) - proj)
+            if dist < min_dist:
+                min_dist = dist
+                nearest_idx = i
+
+        pt1 = contour[nearest_idx]
+        pt2 = contour[(nearest_idx + 1) % len(contour)]
+        seg_vec = np.array(pt2) - np.array(pt1)
+        seg_len = np.linalg.norm(seg_vec)
+        if seg_len < 1:
+            self.statusBar().showMessage("Contour segment too short.")
+            return
+        seg_dir = seg_vec / seg_len
+        perp_dir = np.array([-seg_dir[1], seg_dir[0]])
+        center = (np.array(pt1) + np.array(pt2)) / 2
+        half_width = 50
+        p1 = center - seg_vec / 2 + perp_dir * half_width
+        p2 = center + seg_vec / 2 + perp_dir * half_width
+        p3 = center + seg_vec / 2 - perp_dir * half_width
+        p4 = center - seg_vec / 2 - perp_dir * half_width
+        roi_corners = np.array([p1, p2, p3, p4], dtype=np.float32)
+        dst_rect = np.array([
+            [0, 0],
+            [int(seg_len), 0],
+            [int(seg_len), 100],
+            [0, 100]
+        ], dtype=np.float32)
+        M = cv2.getPerspectiveTransform(roi_corners, dst_rect)
+        roi = cv2.warpPerspective(self.original_image, M, (int(seg_len), 100))
+
+        best_contrast, best_text, best_score = self.find_best_contrast_for_ocr(roi)
+        if best_contrast is not None:
+            self.contrast_slider['slider'].setValue(best_contrast)
+            self.statusBar().showMessage(f"Best contrast for OCR (ROI): {best_contrast} (score: {best_score})")
+            print("Best OCR text sample (ROI):", best_text)
+        else:
+            self.statusBar().showMessage("Auto contrast failed to find a better setting for ROI.")
+
+        # Draw ROI for feedback
+        overlay = self.image.copy() if self.image is not None else self.original_image.copy()
+        roi_poly = roi_corners.astype(np.int32).reshape((-1, 1, 2))
+        cv2.polylines(overlay, [roi_poly], isClosed=True, color=(0, 255, 255), thickness=2)
+        self.image = overlay
+        self.update_canvas_image()
+
+        # Restore normal left click
+        self.set_default_left_click()
+    
+    def on_extract_distances_clicked(self):
+        self.last_contour_distances = self.extract_text_along_decimated_lines()
+    
+    def set_default_left_click(self):
+        try:
+            self.canvas.left_click.disconnect(self.auto_contrast_roi_pick)
+        except Exception:
+            pass
+        try:
+            self.canvas.left_click.disconnect(self.brown_line_click)
+        except Exception:
+            pass
+        try:
+            self.canvas.left_click.disconnect(self.add_seed_point)
+        except Exception:
+            pass
+        self.canvas.left_click.connect(self.add_seed_point)
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = FloodFillApp(root)
-    root.mainloop()
+    app = QApplication(sys.argv)
+    win = FloodFillApp()
+    win.show()
+    sys.exit(app.exec_())
