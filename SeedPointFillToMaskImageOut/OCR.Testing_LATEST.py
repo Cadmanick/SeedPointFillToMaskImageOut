@@ -148,6 +148,9 @@ def merge_boxes(boxes, x_thresh=20, y_thresh=10):
     return merged
 
 class MainWindow(QMainWindow):
+    MERGE_X_THRESH = 30  # Increase for more aggressive merging
+    MERGE_Y_THRESH = 20
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("OCR Testing | Automatic Text Detection w/Adjustments")
@@ -184,27 +187,37 @@ class MainWindow(QMainWindow):
         self.brightness_slider = QSlider(Qt.Horizontal)
         self.brightness_slider.setMinimum(-100)
         self.brightness_slider.setMaximum(100)
-        self.brightness_slider.setValue(20)
+        self.brightness_slider.setValue(50)
+        self.brightness_label = QLabel("Brightness")
+        self.brightness_value = QLabel(str(self.brightness_slider.value()))
 
         self.contrast_slider = QSlider(Qt.Horizontal)
-        self.contrast_slider.setMinimum(10)
-        self.contrast_slider.setMaximum(255)
-        self.contrast_slider.setValue(150)
+        self.contrast_slider.setMinimum(-100)
+        self.contrast_slider.setMaximum(100)
+        self.contrast_slider.setValue(50)
+        self.contrast_label = QLabel("Contrast")
+        self.contrast_value = QLabel(str(self.contrast_slider.value()))
 
         self.erosion_slider = QSlider(Qt.Horizontal)
         self.erosion_slider.setMinimum(0)
-        self.erosion_slider.setMaximum(255)
+        self.erosion_slider.setMaximum(5)
         self.erosion_slider.setValue(0)
+        self.erosion_label = QLabel("Erosion")
+        self.erosion_value = QLabel(str(self.erosion_slider.value()))
 
         self.dilation_slider = QSlider(Qt.Horizontal)
         self.dilation_slider.setMinimum(0)
-        self.dilation_slider.setMaximum(255)
+        self.dilation_slider.setMaximum(5)
         self.dilation_slider.setValue(0)
+        self.dilation_label = QLabel("Dilation")
+        self.dilation_value = QLabel(str(self.dilation_slider.value()))
 
         self.threshold_slider = QSlider(Qt.Horizontal)
         self.threshold_slider.setMinimum(0)
         self.threshold_slider.setMaximum(255)
         self.threshold_slider.setValue(0)
+        self.threshold_label = QLabel("Threshold")
+        self.threshold_value = QLabel(str(self.threshold_slider.value()))
 
         self.gaussian_slider = QSlider(Qt.Horizontal)
         self.gaussian_slider.setMinimum(0)
@@ -212,21 +225,56 @@ class MainWindow(QMainWindow):
         self.gaussian_slider.setSingleStep(2)
         self.gaussian_slider.setPageStep(2)
         self.gaussian_slider.setValue(0)
+        self.gaussian_label = QLabel("Gaussian Blur")
+        self.gaussian_value = QLabel(str(self.gaussian_slider.value()))
 
-        # Labels for sliders (horizontal group)
-        slider_layout = QHBoxLayout()
-        for label, slider in [
-            ("Brightness", self.brightness_slider),
-            ("Contrast", self.contrast_slider),
-            ("Erosion", self.erosion_slider),
-            ("Dilation", self.dilation_slider),
-            ("Threshold", self.threshold_slider),
-            ("Gaussian Blur", self.gaussian_slider)
-        ]:
-            vlayout = QVBoxLayout()
-            vlayout.addWidget(QLabel(label))
-            vlayout.addWidget(slider)
-            slider_layout.addLayout(vlayout)
+        self.merge_x_slider = QSlider(Qt.Horizontal)
+        self.merge_x_slider.setMinimum(0)
+        self.merge_x_slider.setMaximum(100)
+        self.merge_x_slider.setValue(30)
+        self.merge_x_label = QLabel("Merge X")
+        self.merge_x_value = QLabel(str(self.merge_x_slider.value()))
+
+        self.merge_y_slider = QSlider(Qt.Horizontal)
+        self.merge_y_slider.setMinimum(0)
+        self.merge_y_slider.setMaximum(100)
+        self.merge_y_slider.setValue(20)
+        self.merge_y_label = QLabel("Merge Y")
+        self.merge_y_value = QLabel(str(self.merge_y_slider.value()))
+
+        # Now build the list
+        sliders_and_labels = [
+            (self.brightness_label, self.brightness_slider, self.brightness_value),
+            (self.contrast_label, self.contrast_slider, self.contrast_value),
+            (self.erosion_label, self.erosion_slider, self.erosion_value),
+            (self.dilation_label, self.dilation_slider, self.dilation_value),
+            (self.threshold_label, self.threshold_slider, self.threshold_value),
+            (self.gaussian_label, self.gaussian_slider, self.gaussian_value),
+            (self.merge_x_label, self.merge_x_slider, self.merge_x_value),
+            (self.merge_y_label, self.merge_y_slider, self.merge_y_value)
+        ]
+
+        # Split into two rows
+        mid = len(sliders_and_labels) // 2
+        row1 = sliders_and_labels[:mid]
+        row2 = sliders_and_labels[mid:]
+
+        slider_row1 = QHBoxLayout()
+        slider_row2 = QHBoxLayout()
+
+        for group, layout in [(row1, slider_row1), (row2, slider_row2)]:
+            for label, slider, value in group:
+                vlayout = QVBoxLayout()
+                vlayout.addWidget(label, alignment=Qt.AlignHCenter)
+                vlayout.addWidget(slider)
+                vlayout.addSpacing(4)
+                value.setAlignment(Qt.AlignHCenter)
+                vlayout.addWidget(value, alignment=Qt.AlignHCenter)
+                layout.addLayout(vlayout)
+
+        slider_layout = QVBoxLayout()
+        slider_layout.addLayout(slider_row1)
+        slider_layout.addLayout(slider_row2)
 
         # --- Controls layout (buttons + mode) ---
         controls_layout = QHBoxLayout()
@@ -242,7 +290,7 @@ class MainWindow(QMainWindow):
         container = QWidget()
         container.setLayout(layout)
         self.setCentralWidget(container)
-        self.resize(800, 700)
+        self.resize(800, 200)
 
         self._last_pixmap = None
         self.connect_sliders(self.highlight_text)  # <-- Connect sliders to highlight_text for text mode
@@ -256,6 +304,8 @@ class MainWindow(QMainWindow):
             self.dilation_slider.valueChanged.disconnect()
             self.threshold_slider.valueChanged.disconnect()
             self.gaussian_slider.valueChanged.disconnect()
+            self.merge_x_slider.valueChanged.disconnect()
+            self.merge_y_slider.valueChanged.disconnect()
         except Exception:
             pass
         self.brightness_slider.valueChanged.connect(slot)
@@ -264,6 +314,16 @@ class MainWindow(QMainWindow):
         self.dilation_slider.valueChanged.connect(slot)
         self.threshold_slider.valueChanged.connect(slot)
         self.gaussian_slider.valueChanged.connect(slot)
+        self.merge_x_slider.valueChanged.connect(slot)
+        self.merge_y_slider.valueChanged.connect(slot)
+        self.brightness_slider.valueChanged.connect(lambda v: self.brightness_value.setText(str(v)))
+        self.contrast_slider.valueChanged.connect(lambda v: self.contrast_value.setText(str(v)))
+        self.erosion_slider.valueChanged.connect(lambda v: self.erosion_value.setText(str(v)))
+        self.dilation_slider.valueChanged.connect(lambda v: self.dilation_value.setText(str(v)))
+        self.threshold_slider.valueChanged.connect(lambda v: self.threshold_value.setText(str(v)))
+        self.gaussian_slider.valueChanged.connect(lambda v: self.gaussian_value.setText(str(v)))
+        self.merge_x_slider.valueChanged.connect(lambda v: self.merge_x_value.setText(str(v)))
+        self.merge_y_slider.valueChanged.connect(lambda v: self.merge_y_value.setText(str(v)))
 
     def on_mode_changed(self):
         if self.adjust_radio.isChecked():
@@ -363,9 +423,6 @@ class MainWindow(QMainWindow):
                         formatted = f"{direction} {digits[:2]} {digits[2:4]} {digits[4:6]}"
                         text = formatted
                 text = re.sub(r'([A-Z])\1+', r'\1', text)
-                text = text.replace('S', '5')
-                if len(text) > 7:
-                    text = text.replace('5', 'S')
                 text = text.replace('-', '')
                 text = text.replace(' ', '')
                 if text.endswith('.'):
@@ -379,7 +436,11 @@ class MainWindow(QMainWindow):
                     min_box_w, min_box_h = 10, 10
                     if w_exp >= min_box_w and h_exp >= min_box_h:
                         boxes.append((x_exp, y_exp, w_exp, h_exp, text))
-        merged_boxes = merge_boxes(boxes, x_thresh=20, y_thresh=15)
+        merged_boxes = merge_boxes(
+            boxes,
+            x_thresh=self.merge_x_slider.value(),
+            y_thresh=self.merge_y_slider.value()
+        )
         self.viewer.highlight_text(merged_boxes)
 
     def update_preview(self):
