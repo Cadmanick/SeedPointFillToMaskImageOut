@@ -77,7 +77,7 @@ class ImageViewer(QGraphicsView):
                 if QRectF(x, y, w, h).contains(pos):
                     self.selected_box_idx = idx
                     self.highlight_text(self.ocr_boxes)
-                    print(f"Selected text: {text}")
+                    print(f"Selected text: {text.replace(' ', '')}")  # Remove spaces in selected text
                     return
         if event.button() == Qt.MiddleButton:
             self._panning = True
@@ -417,7 +417,6 @@ class MainWindow(QMainWindow):
                 text = text.replace('B', '8')
                 text = re.sub(r'[a-z]', '', text)
                 text = text.replace('-', '')
-                text = text.replace(' ', '')
                 if text.endswith('.'):
                     text = text[:-1]
                 if text.strip():
