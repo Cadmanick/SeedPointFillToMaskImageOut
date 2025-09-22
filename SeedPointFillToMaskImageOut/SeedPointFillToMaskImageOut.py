@@ -1,4 +1,4 @@
-﻿#SeedPointFillToMaskImageOut_qt(r7).py
+﻿#SeedPointFillToMaskImageOut.py
 
 
 import sys
@@ -559,6 +559,12 @@ class FloodFillApp(QMainWindow):
             self.image = self.original_image.copy()
         self.found_contours = []
         self.brown_lines = []  # Clear all brown lines
+        self.mask = None       # Clear mask
+        self.seed_points = []  # Clear seed points
+        self.decimated_contour = None  # Clear simplified contour
+        self.ocr_candidate_boxes = []  # Clear OCR candidate boxes if used
+        self.line_points = []  # Clear measurement line points
+        self.last_contour_distances = None  # Clear cached distances
         self.update_canvas_image()
 
     def fit_to_view(self):

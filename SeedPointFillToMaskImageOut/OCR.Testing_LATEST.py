@@ -77,7 +77,7 @@ class ImageViewer(QGraphicsView):
                 if QRectF(x, y, w, h).contains(pos):
                     self.selected_box_idx = idx
                     self.highlight_text(self.ocr_boxes)
-                    print(f"Selected text: {text.replace(' ', '')}")
+                    print(f"Selected text: {text}")
                     return
         if event.button() == Qt.MiddleButton:
             self._panning = True
@@ -290,7 +290,7 @@ class MainWindow(QMainWindow):
         container = QWidget()
         container.setLayout(layout)
         self.setCentralWidget(container)
-        self.resize(800, 200)
+        self.resize(800, 400)
 
         self._last_pixmap = None
         self.connect_sliders(self.highlight_text)  # <-- Connect sliders to highlight_text for text mode
@@ -412,17 +412,10 @@ class MainWindow(QMainWindow):
                 text = text.replace('"', "").replace("'", "")
                 text = text.replace('_', '')
                 text = text.replace('%', '')
+                text = text.replace(',', '.')
+                text = text.replace('$', 'S')
+                text = text.replace('B', '8')
                 text = re.sub(r'[a-z]', '', text)
-                if re.match(r'^[NWSE]', text):
-                    text = re.sub(r'[^A-Z0-9]', '', text)
-                    m = re.match(r'^([NWSE])\s*([0-9 ]+)', text)
-                    if m:
-                        direction = m.group(1)
-                        digits = re.sub(r'\D', '', m.group(2))
-                        digits = digits.ljust(6, '0')[:6]
-                        formatted = f"{direction} {digits[:2]} {digits[2:4]} {digits[4:6]}"
-                        text = formatted
-                text = re.sub(r'([A-Z])\1+', r'\1', text)
                 text = text.replace('-', '')
                 text = text.replace(' ', '')
                 if text.endswith('.'):
