@@ -77,7 +77,17 @@ class ImageViewer(QGraphicsView):
                 if QRectF(x, y, w, h).contains(pos):
                     self.selected_box_idx = idx
                     self.highlight_text(self.ocr_boxes)
-                    print(f"Selected text: {text.replace(' ', '')}")  # Remove spaces in selected text
+                    selected = text.replace(' ', '')
+                    # Replace double direction letters at the start
+                    selected = re.sub(r'^(EE)', 'E', selected)
+                    selected = re.sub(r'^(WW)', 'W', selected)
+                    selected = re.sub(r'^(NN)', 'N', selected)
+                    selected = re.sub(r'^(SS)', 'S', selected)
+                    if selected and not (selected[0] in 'NWSE' or selected[0].isdigit()):
+                        m = re.search(r'[0-9]', selected)
+                        if m:
+                            selected = selected[m.start():]
+                    print(f"Selected text: {selected}")
                     return
         if event.button() == Qt.MiddleButton:
             self._panning = True
@@ -115,7 +125,7 @@ class ImageViewer(QGraphicsView):
             rect_item = self.scene().addRect(x, y, w, h, pen)
             self._rect_items.append(rect_item)
 
-def merge_boxes(boxes, x_thresh=20, y_thresh=10):
+def merge_boxes(boxes, x_threshold=20, y_threshold=10):
     if not boxes:
         return []
     boxes = sorted(boxes, key=lambda b: (b[1], b[0]))
@@ -130,8 +140,8 @@ def merge_boxes(boxes, x_thresh=20, y_thresh=10):
             if used[j]:
                 continue
             xj, yj, wj, hj, textj = boxes[j]
-            if abs(y - yj) < y_thresh or (y <= yj <= y + h) or (yj <= y <= yj + hj):
-                if 0 < xj - (x + w) < x_thresh or 0 < x - (xj + wj) < x_thresh:
+            if abs(y - yj) < y_threshold or (y <= yj <= y + h) or (yj <= y <= yj + hj):
+                if 0 < xj - (x + w) < x_threshold or 0 < x - (xj + wj) < x_threshold:
                     cluster.append((xj, yj, wj, hj, textj))
                     used[j] = True
         cluster = sorted(cluster, key=lambda b: b[0])
@@ -430,8 +440,8 @@ class MainWindow(QMainWindow):
                         boxes.append((x_exp, y_exp, w_exp, h_exp, text))
         merged_boxes = merge_boxes(
             boxes,
-            x_thresh=self.merge_x_slider.value(),
-            y_thresh=self.merge_y_slider.value()
+            x_threshold=self.merge_x_slider.value(),
+            y_threshold=self.merge_y_slider.value()
         )
         self.viewer.highlight_text(merged_boxes)
 
