@@ -1,4 +1,5 @@
-﻿#SeedPointFillToMaskImageOut.py
+﻿#SeedPointFillToMaskImageOut_qt(r8).py fixed flood fill with GAP pixel and simplify contour should match outer contour simplified contour needs work
+#SeedPointFillToMaskImageOut_qt(r7).py auto select settings for OCR
 
 
 import sys
@@ -14,6 +15,9 @@ from PyQt5.QtGui import QPixmap, QImage, QColor, QCursor, QPainter, QPen
 import os
 import re
 import pytesseract
+import time
+from skimage.morphology import skeletonize
+from skimage.measure import LineModelND, ransac
 
 class CanvasWidget(QLabel):
     left_click = pyqtSignal(int, int)
@@ -29,7 +33,7 @@ class CanvasWidget(QLabel):
         super().__init__(parent)
         self.setMouseTracking(True)
         self.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        self.setStyleSheet("background: #222; border: 1px solid #444;")
+        self.setStyleSheet("background: #ddd; border: 1px solid #888;")
         self.setMinimumSize(800, 600)
 
     def mousePressEvent(self, event):
@@ -85,9 +89,9 @@ class FloodFillApp(QMainWindow):
         self.brown_line_mode = False
         self.brown_line_points = []
         self.brown_lines = []  # Store all brown lines as [(pt1, pt2), ...]
-        self.default_pdf_folder = os.path.expanduser("D:\temp\PlatsForTest")  # or set to your preferred default path
+        self.default_pdf_folder = os.path.expanduser(r"D:\temp\PlatsForTest")  # or set to your preferred default path
         self.last_contour_distances = None
-        
+        self.measure_points = []  # Add to __init__ (after self.line_points = [])
 
         # --- Main layout ---
         central = QWidget()
@@ -102,7 +106,7 @@ class FloodFillApp(QMainWindow):
         slider_layout.addWidget(self.aggressiveness_slider['widget'])
         slider_layout.addSpacing(20)
 
-        self.pixel_slider = self._make_slider("Gap Pixels", 1, 50, 2)
+        self.pixel_slider = self._make_slider("Gap Pixels", 1, 50, 9)
         slider_layout.addWidget(self.pixel_slider['widget'])
         slider_layout.addSpacing(20)
 
@@ -110,16 +114,20 @@ class FloodFillApp(QMainWindow):
         slider_layout.addWidget(self.contrast_slider['widget'])
         slider_layout.addSpacing(20)
 
-        self.kernel_slider = self._make_slider("Kernel Size", 5, 100, 5, self.on_kernel_slider_changed)
-        slider_layout.addWidget(self.kernel_slider['widget'])
-        slider_layout.addSpacing(20)
+        # self.kernel_slider = self._make_slider("Kernel Size", 5, 100, 5, self.on_kernel_slider_changed)
+        # slider_layout.addWidget(self.kernel_slider['widget'])
+        # slider_layout.addSpacing(20)
 
-        self.lambda_slider = self._make_slider("Lambda", 0, 100, 0, self.update_canvas_image)
-        slider_layout.addWidget(self.lambda_slider['widget'])
-        slider_layout.addSpacing(20)
+        # self.lambda_slider = self._make_slider("Lambda", 0, 100, 0, self.update_canvas_image)
+        # slider_layout.addWidget(self.lambda_slider['widget'])
+        # slider_layout.addSpacing(20)
 
         self.simplify_slider = self._make_slider("Simplify Contour", 1, 100, 5, self.on_simplify_slider_changed)
         slider_layout.addWidget(self.simplify_slider['widget'])
+        slider_layout.addSpacing(20)
+
+        self.brightness_slider = self._make_slider("Brightness", -100, 100, 0, self.on_brightness_slider_changed)
+        slider_layout.addWidget(self.brightness_slider['widget'])
         slider_layout.addSpacing(20)
 
         # --- Canvas below sliders ---
@@ -153,7 +161,7 @@ class FloodFillApp(QMainWindow):
         button_layout.addWidget(self.measure_button)
 
         self.simplify_contour_button = QPushButton("2 - Create Simplified Contour")
-        self.simplify_contour_button.clicked.connect(self.create_simplified_contour)
+        self.simplify_contour_button.clicked.connect(self.create_simplified_contour_3)
         button_layout.addWidget(self.simplify_contour_button)
 
         self.export_geotiff_button = QPushButton("5 - Export GeoTIFF")
@@ -193,7 +201,7 @@ class FloodFillApp(QMainWindow):
         self.coord_label = QLabel("Mouse: (x, y)")
         table_layout.addWidget(self.coord_label, alignment=Qt.AlignRight)
 
-        self.distance_label = QLabel("Measured Distance: N/A")
+        self.distance_label = QLabel("Right Click Distance Measure: N/A")
         table_layout.addWidget(self.distance_label, alignment=Qt.AlignRight)
 
         # Scale input (left)
@@ -236,13 +244,22 @@ class FloodFillApp(QMainWindow):
         self.contrast_timer.setSingleShot(True)
         self.contrast_timer.timeout.connect(self.update_canvas_image)
 
-        self.kernel_timer = QTimer(self)
-        self.kernel_timer.setSingleShot(True)
-        self.kernel_timer.timeout.connect(self.create_simplified_contour)
+        # self.kernel_timer = QTimer(self)
+        # self.kernel_timer.setSingleShot(True)
+        # self.kernel_timer.timeout.connect(self.create_simplified_contour)
 
-        self.simplify_timer = QTimer(self)
-        self.simplify_timer.setSingleShot(True)
-        self.simplify_timer.timeout.connect(self.create_simplified_contour)
+        # self.simplify_timer = QTimer(self)
+        # self.simplify_timer.setSingleShot(True)
+        # self.simplify_timer.timeout.connect(self.create_simplified_contour)
+
+        # Initialize additional states for simplified contour 2
+        self.simplified2_yellow_mask = None
+        self.simplified2_inner_contour = None
+        self.simplified2_outer_contour = None
+        self.simplified2_main_closed_line = None
+        self.simplified2_approx_closed_line = None
+        self.simplified2_parallel_contours = None
+        self.skeleton_overlay_img = None
 
     def _make_slider(self, label, minv, maxv, val, slot=None):
         from PyQt5.QtWidgets import QVBoxLayout, QHBoxLayout, QWidget
@@ -283,8 +300,50 @@ class FloodFillApp(QMainWindow):
         self.flood_fill_and_show_mask_contours()
 
     def trace_line(self, x, y):
-        # Port your logic from Tkinter's trace_line here
-        pass
+        """Handle right-click to measure distance between two points and display in distance_label."""
+        img_x, img_y = self.canvas_to_image_coords(x, y)
+        self.measure_points.append((img_x, img_y))
+
+        if len(self.measure_points) == 2:
+            (x1, y1), (x2, y2) = self.measure_points
+            pixel_distance = math.hypot(x2 - x1, y2 - y1)
+            msg = f"Distance: {pixel_distance:.2f} px"
+
+            # If scale is set, convert to feet
+            if self.SCALE_FACTOR and self.SCALE_FACTOR > 0:
+                meters = pixel_distance * self.SCALE_FACTOR
+                feet = meters / 0.3048
+                msg += f" | {feet:.2f} ft"
+
+            self.distance_label.setText(msg)
+
+            # Draw the measurement line as a temporary blue overlay
+            self.update_canvas_image()  # Redraw base image
+            pixmap = self.canvas.pixmap().copy()
+            qp = QPainter(pixmap)
+            pen = QPen(QColor("blue"))
+            pen.setWidth(3)
+            pen.setCapStyle(Qt.RoundCap)
+            qp.setPen(pen)
+            x1c, y1c = self.image_to_canvas_coords(x1, y1)
+            x2c, y2c = self.image_to_canvas_coords(x2, y2)
+            qp.drawLine(x1c, y1c, x2c, y2c)
+            qp.end()
+            self.canvas.setPixmap(pixmap)
+
+            self.measure_points = []  # Reset for next measurement
+        else:
+            # Show a marker for the first point
+            self.update_canvas_image()
+            pixmap = self.canvas.pixmap().copy()
+            qp = QPainter(pixmap)
+            pen = QPen(QColor("blue"))
+            pen.setWidth(3)
+            qp.setPen(pen)
+            x1c, y1c = self.image_to_canvas_coords(img_x, img_y)
+            qp.drawEllipse(QPoint(x1c, y1c), 7, 7)
+            qp.end()
+            self.canvas.setPixmap(pixmap)
 
     def start_pan(self, x, y):
         # Port your logic from Tkinter's start_pan here
@@ -303,9 +362,16 @@ class FloodFillApp(QMainWindow):
             print("No image or seed point.")
             return
 
-        # 1. Flood fill to create mask
-        flood_img = self.original_image.copy()
-        h, w = flood_img.shape[:2]
+        # 1. Flood fill to create mask        
+        contrast_value = self.contrast_slider['slider'].value()
+        alpha = contrast_value / 100.0
+        brightness_value = self.brightness_slider['slider'].value()
+        beta = brightness_value
+        display_img = self.apply_contrast_brightness_preserve_white(self.original_image, alpha, beta)
+        # flood_img = cv2.convertScaleAbs(self.original_image, alpha=alpha, beta=beta)
+        # comment above and uncomment the below to revert to non-contrasted and brightened data for fill
+        # flood_img = self.original_image.copy()
+        h, w = display_img.shape[:2]
         mask = np.zeros((h + 2, w + 2), np.uint8)
 
         mask[0, :] = 1
@@ -314,16 +380,26 @@ class FloodFillApp(QMainWindow):
         mask[:, -1] = 1
 
         aggressiveness = self.aggressiveness_slider['slider'].value()
+        gap_pixels = self.pixel_slider['slider'].value()  # Use Gap Pixels slider
 
-        # --- Morphological operations to close gaps and thicken boundaries ---
-        # gray = cv2.cvtColor(flood_img, cv2.COLOR_BGR2GRAY)
+
+        # # --- Morphological operations to close gaps and thicken boundaries ---
+        # gray = cv2.cvtColor(display_img, cv2.COLOR_BGR2GRAY)
         # _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        # kernel_size = self.kernel_slider['slider'].value()
-        # kernel = np.ones((kernel_size, kernel_size), np.uint8)
+        
+        # kernel = np.ones((gap_pixels, gap_pixels), np.uint8)
         # closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
         # dilated = cv2.dilate(closed, kernel, iterations=1)
         # flood_img = cv2.cvtColor(dilated, cv2.COLOR_GRAY2BGR)
-        # ---------------------------------------------------------------------
+        # # ---------------------------------------------------------------------
+        # # flood_img = display_img
+
+                # Optionally erode image to widen gaps before flood fill
+        if gap_pixels > 1:
+            kernel = np.ones((gap_pixels, gap_pixels), np.uint8)
+            flood_img = cv2.erode(display_img, kernel)
+        else:
+            flood_img = display_img
 
         # Draw brown lines as barriers on the mask (before flood fill)
         if hasattr(self, 'brown_lines'):
@@ -332,7 +408,7 @@ class FloodFillApp(QMainWindow):
                 pt2_mask = (pt2[0] + 1, pt2[1] + 1)
                 cv2.line(mask, pt1_mask, pt2_mask, color=1, thickness=5)
 
-        # Accumulate mask for all seed points
+        # Accumulate mask for all seed points  (not un-proessed display_img)
         for point in self.seed_points:
             cv2.floodFill(
                 flood_img, mask, point, (255, 255, 255),
@@ -356,7 +432,21 @@ class FloodFillApp(QMainWindow):
         overlay[self.mask > 0] = [0, 0, 255]  # Red overlay for mask
         blended = cv2.addWeighted(self.original_image, 0.7, overlay, 0.3, 0)
 
-        # 3. Find contours in the mask and draw them on the overlay
+        # 3. Find contours in the mask and merge close ones
+        mask_for_contours = (self.mask > 0).astype(np.uint8) * 255
+        contours, _ = cv2.findContours(mask_for_contours, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        # --- Merge adjacent contours if endpoints are close, but do not expand outwards ---
+        merge_distance = int(2 * self.pixel_slider['slider'].value())
+        if merge_distance > 1:
+            kernel = np.ones((merge_distance, merge_distance), np.uint8)
+            # 1. Dilate the mask to define the allowed expansion area
+            allowed_area = cv2.dilate(self.mask, kernel, iterations=1)
+            # 2. Morphological closing to connect abutting regions
+            closed = cv2.morphologyEx(self.mask, cv2.MORPH_CLOSE, kernel)
+            # 3. Restrict the closed mask to the allowed area (no outward expansion)
+            self.mask = cv2.bitwise_and(closed, allowed_area)
+
         mask_for_contours = (self.mask > 0).astype(np.uint8) * 255
         contours, _ = cv2.findContours(mask_for_contours, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cv2.drawContours(blended, contours, -1, (0, 255, 0), 2)  # Green contours
@@ -423,8 +513,8 @@ class FloodFillApp(QMainWindow):
 
     def load_pdf(self):
         # Open file dialog to select PDF
-        # file_path = r"D:\temp\PlatsForTest\PB0027_PG0048 - K-4716.pdf"
-        #------------------- comment above line and uncomment below for dialog--------------------
+        # file_path = r"D:\temp\PlatsForTest\PB0008_PG0025 - K-88.pdf"
+        # ------------------- comment above line and uncomment below for dialog--------------------
 
         file_path, _ = QFileDialog.getOpenFileName(
             self,
@@ -475,8 +565,10 @@ class FloodFillApp(QMainWindow):
 
         # Apply contrast adjustment
         contrast_value = self.contrast_slider['slider'].value()
-        alpha = contrast_value / 100.0  # 1.0 = original, <1.0 = less, >1.0 = more
-        display_img = cv2.convertScaleAbs(self.original_image, alpha=alpha, beta=0)
+        alpha = contrast_value / 100.0
+        brightness_value = self.brightness_slider['slider'].value()
+        beta = brightness_value
+        flood_img = cv2.convertScaleAbs(self.original_image, alpha=alpha, beta=beta)
 
         # # If you have ROI boxes to show, overlay them here
         # if self.ocr_candidate_boxes:
@@ -486,26 +578,61 @@ class FloodFillApp(QMainWindow):
 
         # --- Overlay mask if it exists ---
         if self.mask is not None and np.count_nonzero(self.mask) > 0:
-            mask_overlay = display_img.copy()
+            mask_overlay = flood_img.copy()
             mask_overlay[self.mask > 0] = [0, 0, 255]
-            display_img = cv2.addWeighted(display_img, 0.7, mask_overlay, 0.3, 0)
+            flood_img = cv2.addWeighted(flood_img, 0.7, mask_overlay, 0.3, 0)
 
             # Draw outer contours on top of mask overlay ONLY if no simplified contour
             if self.decimated_contour is None:
                 mask_for_contours = (self.mask > 0).astype(np.uint8) * 255
                 contours, _ = cv2.findContours(mask_for_contours, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                cv2.drawContours(display_img, contours, -1, (0, 255, 0), 2)  # Green contours
+                cv2.drawContours(flood_img, contours, -1, (0, 255, 0), 2)  # Green contours
 
         # Draw simplified (decimated) contour if it exists
         if self.decimated_contour is not None:
-            cv2.drawContours(display_img, [self.decimated_contour], -1, (255, 0, 255), 2)  # Magenta
+            cv2.drawContours(flood_img, [self.decimated_contour], -1, (255, 0, 255), 2)  # Magenta
+
+        # Overlay yellow mask and contours from create_simplified_contour_2 if present
+        if self.simplified2_yellow_mask is not None:
+            mask = self.simplified2_yellow_mask
+            # Blend yellow mask
+            flood_img = cv2.addWeighted(flood_img, 0.7, mask, 0.5, 0)
+        if self.simplified2_inner_contour is not None:
+            cv2.drawContours(flood_img, [self.simplified2_inner_contour], -1, (0, 255, 0), 2)
+        if self.simplified2_outer_contour is not None:
+            cv2.drawContours(flood_img, [self.simplified2_outer_contour], -1, (0, 128, 255), 2)
+        if hasattr(self, 'simplified2_long_line_contours') and self.simplified2_long_line_contours:
+            print("simplified2_long_line_contours drawn")
+            cv2.drawContours(flood_img, self.simplified2_long_line_contours, -1, (255, 0, 0), 6)  # RBlue, or any color
+        if self.simplified2_parallel_contours is not None:
+            cv2.drawContours(flood_img, self.simplified2_parallel_contours, -1, (0, 128, 255), 2)   
+        if self.simplified2_approx_closed_line is not None:
+            cv2.drawContours(flood_img, self.simplified2_approx_closed_line, -1, (255, 0, 0), 2)
+
+        # Draw skeleton as contours if available
+        if hasattr(self, 'skeleton_contours') and self.skeleton_contours is not None:
+            cv2.drawContours(flood_img, self.skeleton_contours, -1, (255, 0, 0), 2)
+
+        # # Optionally, blend the skeleton overlay image (red lines) if you want
+        # if self.skeleton_overlay_img is not None:
+        #     if self.skeleton_overlay_img.shape == flood_img.shape:
+        #         flood_img = cv2.addWeighted(flood_img, 0.1, self.skeleton_overlay_img, 1.0, 0)
+        #     else:
+        #         skeleton_resized = cv2.resize(
+        #             self.skeleton_overlay_img,
+        #             (flood_img.shape[1], flood_img.shape[0]),
+        #             interpolation=cv2.INTER_LINEAR
+        #         )
+        #         flood_img = cv2.addWeighted(flood_img, 0.7, skeleton_resized, 0.5, 0)
+
+            #####   place all objects on canvas above this line   #####
 
         # Resize image to fit canvas, considering zoom and pan
-        h, w = display_img.shape[:2]
+        h, w = flood_img.shape[:2]
         scale = self.zoom_level
         new_w = int(w * scale)
         new_h = int(h * scale)
-        resized = cv2.resize(display_img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        resized = cv2.resize(flood_img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
 
         # Create QImage and QPixmap
         qimg = QImage(resized.data, resized.shape[1], resized.shape[0], resized.strides[0], QImage.Format_RGB888)
@@ -526,6 +653,7 @@ class FloodFillApp(QMainWindow):
             if painter:
                 painter.end()
         self.canvas.setPixmap(display_pixmap)
+
         # Draw brown lines
         if hasattr(self, 'brown_lines'):
             painter = QPainter(self.canvas.pixmap())
@@ -554,17 +682,68 @@ class FloodFillApp(QMainWindow):
                 painter.drawLine(x1, y1, x2, y2)
             painter.end()
 
+            # Draw skeleton best-fit lines in cyan
+        if hasattr(self, 'skeleton_fit_lines') and self.skeleton_fit_lines:
+            painter = QPainter(self.canvas.pixmap())
+            pen = QPen(QColor(0, 255, 255), 3)  # Cyan, width 3
+            pen.setCapStyle(Qt.RoundCap)
+            painter.setPen(pen)
+            for pt1, pt2 in self.skeleton_fit_lines:
+                x1, y1 = self.image_to_canvas_coords(pt1[0], pt1[1])
+                x2, y2 = self.image_to_canvas_coords(pt2[0], pt2[1])
+                painter.drawLine(x1, y1, x2, y2)
+            # Draw intersection points as magenta circles
+            if hasattr(self, 'skeleton_fit_intersections'):
+                pen = QPen(QColor(255, 0, 255), 2)
+                painter.setPen(pen)
+                for pt in self.skeleton_fit_intersections:
+                    x, y = self.image_to_canvas_coords(pt[0], pt[1])
+                    painter.drawEllipse(QPoint(x, y), 8, 8)
+            painter.end()
+
+        # # Draw simplified2_approx_closed_line if it exists
+        # if hasattr(self, 'simplified2_approx_closed_line') and self.simplified2_approx_closed_line is not None:
+        #     cv2.drawContours(flood_img, [self.simplified2_approx_closed_line], -1, (255, 0, 255), 2)
+        #     self.statusBar().showMessage("started Simplified Contour 2 method, with simplified2_approx_closed_line")
+        # #Draw simplified main closed line if it exists
+        # if hasattr(self, 'simplified2_main_closed_line') and self.simplified2_main_closed_line is not None:
+        #     cv2.drawContours(flood_img, [self.simplified2_main_closed_line], -1, (0, 0, 255), 2)  # Red or any color
+        # # if hasattr(self, 'simplified2_main_closed_line') and self.simplified2_main_closed_line is not None:
+        # #     painter = QPainter(self.canvas.pixmap())
+        # #     # Blue for the main closed line
+        # #     pen = QPen(QColor(255, 0, 0))  
+        # #     pen.setWidth(2)
+        # #     pen.setCapStyle(Qt.RoundCap)
+        # #     painter.setPen(pen)
+        # #     # Extract x, y coordinates
+        # #     closed_line = self.simplified2_main_closed_line.reshape(-1, 2)
+        # #     for i in range(len(closed_line)):
+        # #         x1, y1 = closed_line[i - 1]
+        # #         x2, y2 = closed_line[i]
+        # #         cx1, cy1 = self.image_to_canvas_coords(x1, y1)
+        # #         cx2, cy2 = self.image_to_canvas_coords(x2, y2)
+        # #         painter.drawLine(cx1, cy1, cx2, cy2)
+        # #     painter.end()
+
+        #     # Draw simplified2_approx_closed_line if it exists
+        # if hasattr(self, 'simplified2_approx_closed_line') and self.simplified2_approx_closed_line is not None:
+        #     cv2.drawContours(flood_img, [self.simplified2_approx_closed_line], -1, (255, 0, 255), 2)
+        #     self.statusBar().showMessage("started Simplified Contour 2 method, with simplified2_approx_closed_line")
+        #     # Draw simplified2_parallel_contours if they exist
+        # if hasattr(self, 'simplified2_parallel_contours') and self.simplified2_parallel_contours:
+        #     cv2.drawContours(flood_img, self.simplified2_parallel_contours, -1, (0, 0, 255), 2)  # Red, or any color you like
+        #      # Draw long line contours if present
+        
+
+        # Check if skeleton overlay exists and blend if so
+
+
     def clear_canvas(self):
         if hasattr(self, 'original_image') and self.original_image is not None:
             self.image = self.original_image.copy()
         self.found_contours = []
+        self.mask = None
         self.brown_lines = []  # Clear all brown lines
-        self.mask = None       # Clear mask
-        self.seed_points = []  # Clear seed points
-        self.decimated_contour = None  # Clear simplified contour
-        self.ocr_candidate_boxes = []  # Clear OCR candidate boxes if used
-        self.line_points = []  # Clear measurement line points
-        self.last_contour_distances = None  # Clear cached distances
         self.update_canvas_image()
 
     def fit_to_view(self):
@@ -746,37 +925,82 @@ class FloodFillApp(QMainWindow):
     def update_aggressiveness_value_label(self, v):
         self.aggressiveness_slider['value_label'].setText(str(int(float(v))))
 
-    def create_simplified_contour(self):
-        if self.mask is None or np.count_nonzero(self.mask) == 0:
-            return
+    # def create_simplified_contour(self):
+    #     if self.mask is None or np.count_nonzero(self.mask) == 0:
+    #         return
 
-        # Apply morphological closing/opening with kernel size from slider
-        kernel_size = self.kernel_slider['slider'].value()
-        if kernel_size > 1:
-            kernel = np.ones((kernel_size, kernel_size), np.uint8)
-            mask_for_contours = cv2.morphologyEx(self.mask, cv2.MORPH_CLOSE, kernel)
-        else:
-            mask_for_contours = self.mask.copy()
+    #     # Dilate mask to move bounds closer to center of black lines
+    #     dilate_amt = max(1, int(round(self.pixel_slider['slider'].value() * 1.23)))
+    #     kernel = np.ones((dilate_amt, dilate_amt), np.uint8)
+    #     mask_dilated = cv2.dilate(self.mask, kernel, iterations=1)
 
-        if mask_for_contours.max() > 1:
-            mask_for_contours = (mask_for_contours > 0).astype(np.uint8) * 255
-        contours, _ = cv2.findContours(mask_for_contours, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
-        if not contours:
-            return
+    #     # Apply morphological closing/opening with kernel size from slider
+    #     kernel_size = self.pixel_slider['slider'].value()
+    #     if kernel_size > 1:
+    #         kernel2 = np.ones((kernel_size, kernel_size), np.uint8)
+    #         mask_for_contours = cv2.morphologyEx(mask_dilated, cv2.MORPH_CLOSE, kernel2)
+    #     else:
+    #         mask_for_contours = mask_dilated.copy()
 
-        largest_contour = max(contours, key=cv2.contourArea)
-        slider_value = self.simplify_slider['slider'].value()  # 1-100
-        epsilon = (slider_value / 1000.0) * cv2.arcLength(largest_contour, True)  # 0.0010.1 * arcLength
-        simplified = cv2.approxPolyDP(largest_contour, epsilon, True)
+    #     if mask_for_contours.max() > 1:
+    #         mask_for_contours = (mask_for_contours > 0).astype(np.uint8) * 255
+    #     contours, _ = cv2.findContours(mask_for_contours, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
+    #     if not contours:
+    #         return
 
-        print(f"Original points: {len(largest_contour)}, Simplified: {len(simplified)}, Epsilon: {epsilon:.4f}, Kernel: {kernel_size}")
+    #     # --- JOIN ADJACENT CONTOURS AT ENDPOINTS IF CLOSE ---
+    #     # join_distance = 20  # pixels
+    #     join_distance = kernel_size * 2.5
+    #     merged = [c.squeeze(axis=1) if len(c.shape) == 3 else c for c in contours]
+    #     changed = True
+    #     while changed and len(merged) > 1:
+    #         changed = False
+    #         for i in range(len(merged)):
+    #             for j in range(i + 1, len(merged)):
+    #                 ci, cj = merged[i], merged[j]
+    #                 # Endpoints
+    #                 ends_i = [ci[0], ci[-1]]
+    #                 ends_j = [cj[0], cj[-1]]
+    #                 # Find closest pair of endpoints
+    #                 dists = np.array([[np.linalg.norm(ei - ej) for ej in ends_j] for ei in ends_i])
+    #                 min_idx = np.unravel_index(np.argmin(dists), dists.shape)
+    #                 if dists[min_idx] < join_distance:
+    #                     # Merge contours at closest endpoints
+    #                     ei_idx, ej_idx = min_idx
+    #                     # Reverse as needed to join ends
+    #                     if ei_idx == 0:
+    #                         ci = ci[::-1]
+    #                     if ej_idx == 1:
+    #                         cj = cj[::-1]
+    #                     # Concatenate, avoid duplicate point
+    #                     new_contour = np.vstack([ci, cj[1:]])
+    #                     # Replace and remove
+    #                     merged[i] = new_contour
+    #                     merged.pop(j)
+    #                     changed = True
+    #                     break
+    #             if changed:
+    #                 break
 
-        self.decimated_contour = simplified
+    #     if not merged:
+    #         return
 
-        contour_img = self.original_image.copy()
-        cv2.drawContours(contour_img, [simplified], -1, (255, 0, 255), 2)
-        self.image = contour_img
-        self.update_canvas_image()          
+    #     largest_contour = max(merged, key=lambda c: cv2.contourArea(c.reshape(-1, 1, 2)))
+    #     largest_contour = largest_contour.reshape(-1, 1, 2)
+    #     # ---------------------------------------------------
+
+    #     slider_value = self.simplify_slider['slider'].value()  # 1-100
+    #     epsilon = (slider_value / 1000.0) * cv2.arcLength(largest_contour, True)  # 0.001–0.1 * arcLength
+    #     simplified = cv2.approxPolyDP(largest_contour, epsilon, True)
+
+    #     print(f"Original points: {len(largest_contour)}, Simplified: {len(simplified)}, Epsilon: {epsilon:.4f}, Kernel: {kernel_size}")
+
+    #     self.decimated_contour = simplified
+
+    #     contour_img = self.original_image.copy()
+    #     cv2.drawContours(contour_img, [simplified], -1, (255, 0, 255), 2)
+    #     self.image = contour_img
+    #     self.update_canvas_image()          
 
     def canvas_to_image_coords(self, x, y):
         """Convert canvas (widget) coordinates to image coordinates, considering pan and zoom."""
@@ -821,12 +1045,14 @@ class FloodFillApp(QMainWindow):
         roi_eq = cv2.equalizeHist(roi_sharp)
 
         # Threshold (try both adaptive and binary)
-        roi_thresh = cv2.adaptiveThreshold(
-            roi_eq, 255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY,
-            11, 2
-        )
+        roi_thresh = roi_eq 
+        # Uncomment below to try adaptive thresholding and comment above line
+        # roi_thresh = cv2.adaptiveThreshold(
+        #     roi_eq, 255,
+        #     cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        #     cv2.THRESH_BINARY,
+        #     11, 2
+        # )
         # Optionally try: _, roi_thresh = cv2.threshold(roi_eq, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
         # Upscale more aggressively
@@ -836,6 +1062,14 @@ class FloodFillApp(QMainWindow):
         pad = 20
         roi_up = cv2.copyMakeBorder(roi_up, 0, 0, pad, pad, cv2.BORDER_CONSTANT, value=255)
 
+        # --- Output the preprocessed ROI image ---
+        output_dir = "roi_debug_output"
+        os.makedirs(output_dir, exist_ok=True)
+        filename = f"roi_{int(time.time() * 1000)}.png"
+        output_path = os.path.join(output_dir, filename)
+        cv2.imwrite(output_path, roi_up)
+        print(f"Saved preprocessed ROI to {output_path}")
+
         return roi_up
 
     def extract_text_along_decimated_lines(self):
@@ -844,7 +1078,7 @@ class FloodFillApp(QMainWindow):
 
         img = self.image.copy()
         contour = self.decimated_contour
-        line_width = 200
+        line_width = 100
         results = []
 
         # Use the largest contour for distance calculation
@@ -896,17 +1130,13 @@ class FloodFillApp(QMainWindow):
                 if x_min >= x_max or y_min >= y_max:
                     continue
                 roi = rotated[y_min:y_max, x_min:x_max]
-
-                # --- Save the ROI for review ---
-                roi_save_dir = "roi_review"
-                os.makedirs(roi_save_dir, exist_ok=True)
-                roi_filename = os.path.join(roi_save_dir, f"roi_segment_{i}.png")
-                cv2.imwrite(roi_filename, roi)
+                if roi.size == 0 or roi.shape[0] < 5 or roi.shape[1] < 5:
+                    continue
 
                 # --- Preprocess ROI before OCR ---
-                #roi_proc = self.preprocess_roi_for_ocr(roi)
+                roi_proc = self.preprocess_roi_for_ocr(roi)
                 #comment out above line and use below line to skip preprocessing
-                roi_proc = roi
+                #roi_proc = roi
                 ocr_text = pytesseract.image_to_string(roi_proc, config="--psm 6").strip()
 
                 roi_inverted = cv2.rotate(roi, cv2.ROTATE_180)
@@ -1120,7 +1350,7 @@ class FloodFillApp(QMainWindow):
     def on_contrast_slider_changed(self):
         self.contrast_timer.start(200)
 
-    def on_kernel_slider_changed(self):
+    def on_pixel_slider_changed(self):
         self.kernel_timer.start(200)
 
     def on_simplify_slider_changed(self):
@@ -1183,6 +1413,7 @@ class FloodFillApp(QMainWindow):
             x2, y2 = self.roi_end
             painter.drawRect(min(x1, x2), min(y1, y2), abs(x2 - x1), abs(y2 - y1))
             painter.end()
+
     def auto_contrast_roi_pick(self, x, y):
         img_x, img_y = self.canvas_to_image_coords(x, y)
         if self.decimated_contour is None:
@@ -1269,68 +1500,431 @@ class FloodFillApp(QMainWindow):
             pass
         self.canvas.left_click.connect(self.add_seed_point)
 
-def set_dark_mode(app):
-    from PyQt5.QtGui import QPalette, QColor
-    from PyQt5.QtCore import Qt
-    dark_palette = QPalette()
-    dark_palette.setColor(QPalette.Window, QColor(30, 30, 30))
-    dark_palette.setColor(QPalette.WindowText, Qt.white)
-    dark_palette.setColor(QPalette.Base, QColor(25, 25, 25))
-    dark_palette.setColor(QPalette.AlternateBase, QColor(30, 30, 30))
-    dark_palette.setColor(QPalette.ToolTipBase, Qt.white)
-    dark_palette.setColor(QPalette.ToolTipText, Qt.white)
-    dark_palette.setColor(QPalette.Text, Qt.white)
-    dark_palette.setColor(QPalette.Button, QColor(45, 45, 45))
-    dark_palette.setColor(QPalette.ButtonText, Qt.white)
-    dark_palette.setColor(QPalette.BrightText, Qt.red)
-    dark_palette.setColor(QPalette.Link, QColor(42, 130, 218))
-    dark_palette.setColor(QPalette.Highlight, QColor(42, 130, 218))
-    dark_palette.setColor(QPalette.HighlightedText, Qt.black)
-    app.setPalette(dark_palette)
-    app.setStyleSheet("""
-        QPushButton {
-            background-color: #444444;
-            color: #f0f0f0;
-            border-radius: 4px;
-            padding: 6px 18px;
-            border: 1px solid #666;
-        }
-        QPushButton:hover {
-            background-color: #666666;
-            color: #fff;
-        }
-        QLineEdit, QTextEdit {
-            background-color: #222;
-            color: #fff;
-            border: 1px solid #555;
-        }
-        QLabel { color: #fff; }
-        QSlider::groove:horizontal {
-            background: #444;
-            height: 8px;
-            border-radius: 4px;
-        }
-        QSlider::handle:horizontal {
-            background: #888;
-            border: 2px solid #aaa;
-            width: 18px;
-            margin: -6px 0;
-            border-radius: 9px;
-        }
-        QSlider::sub-page:horizontal {
-            background: #666;
-            border-radius: 4px;
-        }
-        QSlider::add-page:horizontal {
-            background: #333;
-            border-radius: 4px;
-        }
-        QWidget { background-color: #222; }
-    """)
+    def on_brightness_slider_changed(self):
+        self.update_canvas_image()
+    
+    def reset_all_sliders(self):
+        # Reset all sliders to their default values
+        self.aggressiveness_slider['slider'].setValue(25)
+        self.pixel_slider['slider'].setValue(2)
+        self.contrast_slider['slider'].setValue(100)
+        # self.kernel_slider['slider'].setValue(5)
+        # self.lambda_slider['slider'].setValue(0)
+        self.simplify_slider['slider'].setValue(5)
+        self.brightness_slider['slider'].setValue(0)
+
+        # Also update the displayed values
+        self.aggressiveness_slider['value_label'].setText("25")
+        self.pixel_slider['value_label'].setText("2")
+        self.contrast_slider['value_label'].setText("100")
+        # self.kernel_slider['value_label'].setText("5")
+        # self.lambda_slider['value_label'].setText("0")
+        self.simplify_slider['value_label'].setText("5")
+        self.brightness_slider['value_label'].setText("0")
+
+                # Reset other relevant states if necessary
+        self.mask = None
+        self.seed_points = []
+        self.image = self.original_image.copy() if self.original_image is not None else None
+
+        self.update_canvas_image()
+
+    @staticmethod
+    def apply_contrast_brightness_preserve_white(img, alpha, beta):
+        img = img.astype(np.float32)
+        # Save mask of white pixels
+        white_mask = np.all(img == 255, axis=2) if img.ndim == 3 else (img == 255)
+        # Apply contrast and brightness
+        img = img * alpha + beta
+        # Restore white pixels
+        if img.ndim == 3:
+            img[white_mask] = 255
+        else:
+            img[white_mask] = 255
+        # Clip to [0, 255] and convert back to uint8
+        img = np.clip(img, 0, 255).astype(np.uint8)
+        return img
+
+    def create_simplified_contour_2(self):
+        if self.mask is None or np.count_nonzero(self.mask) == 0:
+            return
+
+        mask_orig = (self.mask > 0).astype(np.uint8) * 255
+        contours, _ = cv2.findContours(mask_orig, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return
+        outer_contour = max(contours, key=cv2.contourArea)
+
+        expand_amt = max(1, int(self.pixel_slider['slider'].value() * 4))
+        kernel = np.ones((expand_amt, expand_amt), np.uint8)
+        mask_expanded = cv2.dilate(mask_orig, kernel, iterations=1)
+        contours_exp, _ = cv2.findContours(mask_expanded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours_exp:
+            return
+        outer_contour_exp = max(contours_exp, key=cv2.contourArea)
+
+        mask_between = np.zeros_like(mask_orig)
+        cv2.drawContours(mask_between, [outer_contour_exp], -1, 255, thickness=cv2.FILLED)
+        cv2.drawContours(mask_between, [outer_contour], -1, 0, thickness=cv2.FILLED)
+
+        yellow_mask = np.zeros_like(self.original_image)
+        yellow_mask[mask_between > 0] = (0, 255, 255)  # Yellow
+
+        # 1. Get the underlaid image (use contrast/brightness adjusted or self.original_image)
+        underlaid = self.apply_contrast_brightness_preserve_white(self.original_image, 1.0, 0)  # or use your adjusted image
+
+        # 2. Convert to grayscale
+        gray = cv2.cvtColor(underlaid, cv2.COLOR_BGR2GRAY)
+
+        # 3. Apply threshold or edge detection
+        # Option 1: Simple threshold
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # Option 2: Canny edge detection (for dashed/complex lines, sometimes better)
+        # binary = cv2.Canny(gray, 50, 150)
+
+        # 4. Find contours on the binary image
+        masked_binary = cv2.bitwise_and(binary, binary, mask=mask_between)
+        all_contours, _ = cv2.findContours(masked_binary, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        long_line_contours = []
+        min_length = 20  # Adjust as needed for "long" lines
+
+        for cnt in all_contours:
+            arc_len = cv2.arcLength(cnt, False)
+            if arc_len > min_length:
+                epsilon = 0.01 * arc_len
+                approx = cv2.approxPolyDP(cnt, epsilon, False)
+                long_line_contours.append(approx)
+        print(f"Found {len(long_line_contours)} long line contours")
+        self.simplified2_long_line_contours = long_line_contours if long_line_contours else None
+        
+        # Store other overlays as before
+        self.simplified2_yellow_mask = yellow_mask
+        self.simplified2_inner_contour = outer_contour
+        self.simplified2_outer_contour = outer_contour_exp
+
+        self.update_canvas_image()
+        # # Find all contours in the yellow mask
+        # all_contours, _ = cv2.findContours(mask_between, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        # epsilon_outer = 0.01 * cv2.arcLength(outer_contour, True)
+        # approx_outer = cv2.approxPolyDP(outer_contour, epsilon_outer, True)
+
+        # # parallel_contours = []
+        # # angle_threshold = 10  # degrees
+
+        # # for cnt in all_contours:
+        # #     if cv2.contourArea(cnt) < 100:  # skip small contours
+        # #         continue
+        # #     # Approximate contour
+        # #     epsilon = 0.01 * cv2.arcLength(cnt, True)
+        # #     approx = cv2.approxPolyDP(cnt, epsilon, True)
+        # #     # Compare angles with outer contour
+        # #     if len(approx) < 2 or len(approx_outer) < 2:
+        # #         continue
+        # #     angles_inner = []
+        # #     angles_outer = []
+        # #     for i in range(len(approx)):
+        # #         p1 = approx[i][0]
+        # #         p2 = approx[(i+1)%len(approx)][0]
+        # #         v = p2 - p1
+        # #         angle = np.arctan2(v[1], v[0])
+        # #         angles_inner.append(angle)
+        # #     for i in range(len(approx_outer)):
+        # #         p1 = approx_outer[i][0]
+        # #         p2 = approx_outer[(i+1)%len(approx_outer)][0]
+        # #         v = p2 - p1
+        # #         angle = np.arctan2(v[1], v[0])
+        # #         angles_outer.append(angle)
+        # #     # Compare mean angle difference
+        # #     mean_angle_inner = np.mean(angles_inner)
+        # #     mean_angle_outer = np.mean(angles_outer)
+        # #     angle_diff = np.abs(np.rad2deg(mean_angle_inner - mean_angle_outer))
+        # #     if angle_diff > 180:
+        # #         angle_diff = 360 - angle_diff
+        # #     if angle_diff < angle_threshold:
+        # #         parallel_contours.append(approx)
+
+        # # # Fit lines to each parallel contour and extend to intersection
+        # # # For simplicity, use the largest parallel contour
+        # # if parallel_contours:
+        # #     largest = max(parallel_contours, key=cv2.contourArea)
+        # #     # Fit lines to each segment
+        # #     lines = []
+        # #     for i in range(len(largest)):
+        # #         p1 = largest[i][0]
+        # #         p2 = largest[(i+1)%len(largest)][0]
+        # #         lines.append((p1, p2))
+        # #     # Find intersections
+        # #     def line_intersection(line1, line2):
+        # #         xdiff = (line1[0][0] - line1[1][0], line2[0][0] - line2[1][0])
+        # #         ydiff = (line1[0][1] - line1[1][1], line2[0][1] - line2[1][1])
+        # #         def det(a, b):
+        # #             return a[0] * b[1] - a[1] * b[0]
+        # #         div = det(xdiff, ydiff)
+        # #         if div == 0:
+        # #             return None
+        # #         d = (det(*line1), det(*line2))
+        # #         x = det(d, xdiff) / div
+        # #         y = det(d, ydiff) / div
+        # #         return int(x), int(y)
+        # #     intersections = []
+        # #     for i in range(len(lines)):
+        # #         l1 = lines[i]
+        # #         l2 = lines[(i+1)%len(lines)]
+        # #         pt = line_intersection(l1, l2)
+        # #         if pt is not None:
+        # #             intersections.append([[pt]])
+        # #     approx_poly = np.array(intersections, dtype=np.int32)
+        # #     self.simplified2_approx_closed_line = approx_poly
+        # #     # Print the list of vertices
+        # #     print("simplified2_approx_closed_line vertices:")
+        # #     for pt in approx_poly.reshape(-1, 2):
+        # #         print(tuple(pt))
+        # #     self.simplified2_parallel_contours = parallel_contours
+        # # else:
+        # #     self.simplified2_approx_closed_line = None
+        # #     self.simplified2_parallel_contours = None
+        # #     print("simplified2_approx_closed_line vertices: none")
+
+        # self.simplified2_yellow_mask = yellow_mask
+        # self.simplified2_inner_contour = outer_contour
+        # self.simplified2_outer_contour = outer_contour_exp
+        # # self.image = blended
+        # self.update_canvas_image()
+        
+        # --- Find, simplify, and store long line contours ---
+
+
+    def create_simplified_contour_3(self):
+        if self.mask is None or np.count_nonzero(self.mask) == 0:
+            return
+
+        mask_orig = (self.mask > 0).astype(np.uint8) * 255
+        contours, _ = cv2.findContours(mask_orig, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return
+        outer_contour = max(contours, key=cv2.contourArea)
+        epsilon_outer = 0.01 * cv2.arcLength(outer_contour, True)
+        approx_outer = cv2.approxPolyDP(outer_contour, epsilon_outer, True)
+
+        expand_amt = max(1, int(self.pixel_slider['slider'].value() * 4))
+        kernel = np.ones((expand_amt, expand_amt), np.uint8)
+        mask_expanded = cv2.dilate(mask_orig, kernel, iterations=1)
+        contours_exp, _ = cv2.findContours(mask_expanded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours_exp:
+            return
+        outer_contour_exp = max(contours_exp, key=cv2.contourArea)
+
+        mask_between = np.zeros_like(mask_orig)
+        cv2.drawContours(mask_between, [outer_contour_exp], -1, 255, thickness=cv2.FILLED)
+        cv2.drawContours(mask_between, [outer_contour], -1, 0, thickness=cv2.FILLED)
+
+        yellow_mask = np.zeros_like(self.original_image)
+        yellow_mask[mask_between > 0] = (0, 255, 255)  # Yellow
+
+        # 1. Get the underlaid image (use contrast/brightness adjusted or self.original_image)
+        underlaid = self.apply_contrast_brightness_preserve_white(self.original_image, 1.0, 0)  # or use your adjusted image
+
+        # 2. Convert to grayscale
+        gray = cv2.cvtColor(underlaid, cv2.COLOR_BGR2GRAY)
+
+        # 3. Apply threshold or edge detection
+        # Option 1: Simple threshold
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # Option 2: Canny edge detection (for dashed/complex lines, sometimes better)
+        # binary = cv2.Canny(gray, 50, 150)
+
+        # 4. Find contours on the binary image
+        masked_binary = cv2.bitwise_and(binary, binary, mask=mask_between)
+        masked_binary[mask_between == 0] = 255  # Make mask area white
+        all_contours, _ = cv2.findContours(masked_binary, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # --- DEBUGGING: Show all contours found in the masked binary image
+        debug_img = underlaid.copy()
+        cv2.drawContours(debug_img, all_contours, -1, (255, 0, 0), 1)  # Draw in red
+        cv2.imshow("All Contours", debug_img)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+        # ----------------------------------------
+
+        # --- DEBUGGING: Show the masked binary image
+        cv2.imshow("Masked Binary", masked_binary)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+        # ----------------------------------------
+
+        # long_line_contours = []
+        # min_length = 2  # Adjust as needed for "long" lines
+
+        # --- Skeletonize the masked area to get the centerline ---
+        from skimage.morphology import skeletonize
+        
+        # Invert masked_binary so the line is white (foreground) and background is black
+        masked_binary_inverted = cv2.bitwise_not(masked_binary)
+
+        # Convert to boolean for skeletonize (expects 0/1)
+        masked_bool = (masked_binary_inverted > 0)
+        skeleton = skeletonize(masked_bool)
+        skeleton_uint8 = (skeleton * 255).astype(np.uint8)
+
+        # Find contours on the skeleton (centerline)
+        skeleton_contours, _ = cv2.findContours(skeleton_uint8, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+
+        raw_centerlines = [cnt for cnt in skeleton_contours if len(cnt) >= 10]
+        # def contour_mostly_inside_mask(contour, mask, threshold=0.75):
+        #     pts = contour.reshape(-1, 2)
+        #     inside = mask[pts[:,1], pts[:,0]] > 0
+        #     return np.mean(inside) >= threshold
+
+        # raw_centerlines = [
+        #     cnt for cnt in skeleton_contours
+        #     if len(cnt) >= 10 and contour_mostly_inside_mask(cnt, mask_between)
+        # raw_centerlines = [cnt for cnt in skeleton_contours if len(cnt) >= 10]
+
+        # Save for debugging if needed
+        cv2.imwrite(r"C:\Users\nicho\source\repos\miT\SeedPointFillToMaskImageOut-miT\SeedPointFillToMaskImageOut\maskedBinary1.png", masked_binary)
+        cv2.imwrite(r"C:\Users\nicho\source\repos\miT\SeedPointFillToMaskImageOut-miT\SeedPointFillToMaskImageOut\skeleton.png", skeleton_uint8)
+
+        # # Convert underlaid to BGR if needed
+        # if len(underlaid.shape) == 2:
+        #     underlaid_bgr = cv2.cvtColor(underlaid, cv2.COLOR_GRAY2BGR)
+        # else:
+        #     underlaid_bgr = underlaid.copy()
+
+        # # Resize skeleton to match underlaid image size
+        # skeleton_resized = cv2.resize(
+        #     skeleton_uint8,
+        #     (underlaid_bgr.shape[1], underlaid_bgr.shape[0]),
+        #     interpolation=cv2.INTER_NEAREST
+        # )
+
+        # Create a red overlay image for the skeleton for output display... does not work...
+        if len(underlaid.shape) == 2:
+            underlaid_bgr = cv2.cvtColor(underlaid, cv2.COLOR_GRAY2BGR)
+        else:
+            underlaid_bgr = underlaid.copy()
+
+        skeleton_resized = cv2.resize(
+            skeleton_uint8,
+            (underlaid_bgr.shape[1], underlaid_bgr.shape[0]),
+            interpolation=cv2.INTER_NEAREST
+        )
+        red_overlay = np.zeros_like(underlaid_bgr)
+        red_overlay[skeleton_resized > 0] = (0, 0, 255)  # BGR: red
+        alpha = 1.0  # Full opacity for the skeleton
+        overlay_img = cv2.addWeighted(underlaid_bgr, 1.0, red_overlay, alpha, 0)
+
+        self.skeleton_contours = raw_centerlines if raw_centerlines else None
+        self.skeleton_overlay_img = overlay_img  # This is the red overlay image
+        #self.simplified2_approx_closed_line = raw_centerlines if raw_centerlines else None  # This is a list of contours
+        # Store the raw centerlines for drawing as contours
+        # self.simplified2_approx_closed_line = raw_centerlines if raw_centerlines else None
+        # --- Find and fit long lines to skeletonized contours ---
+        min_length = self.pixel_slider['slider'].value() * 4
+        long_lines = [cnt for cnt in raw_centerlines if len(cnt) >= min_length]
+
+        min_length = self.pixel_slider['slider'].value() * 4
+        self.compute_skeleton_fit_lines_and_intersections(
+            raw_centerlines,
+            mask_between.shape,
+            min_length
+        )
+
+        self.simplified2_yellow_mask = yellow_mask
+        self.simplified2_inner_contour = outer_contour
+        self.simplified2_outer_contour = outer_contour_exp
+        self.update_canvas_image()
+        
+    def compute_skeleton_fit_lines_and_intersections(self, raw_centerlines, mask_shape, min_length):
+        """
+        Given skeleton contours, compute best-fit lines (extended to mask/image bounds)
+        and their intersection points. Then trim each line to run only between its intersection points.
+        Stores results in self.skeleton_fit_lines and self.skeleton_fit_intersections.
+        """
+        fit_lines = []
+        h, w = mask_shape
+
+        # 1. Fit lines to contours
+        for cnt in raw_centerlines:
+            if len(cnt) < min_length:
+                continue
+            cnt_pts = cnt.reshape(-1, 2).astype(np.float32)
+            if cnt_pts.shape[0] < 2:
+                continue
+            [vx, vy, x0, y0] = cv2.fitLine(cnt_pts, cv2.DIST_L2, 0, 0.01, 0.01)
+            # Calculate two points far along the line direction (for intersection math)
+            left_y = int((-x0 * vy / vx) + y0) if vx != 0 else 0
+            right_y = int(((w - x0) * vy / vx) + y0) if vx != 0 else h-1
+            top_x = int((-y0 * vx / vy) + x0) if vy != 0 else 0
+            bottom_x = int(((h - y0) * vx / vy) + x0) if vy != 0 else w-1
+
+            points = []
+            if 0 <= left_y < h:
+                points.append((0, left_y))
+            if 0 <= right_y < h:
+                points.append((w-1, right_y))
+            if 0 <= top_x < w:
+                points.append((top_x, 0))
+            if 0 <= bottom_x < w:
+                points.append((bottom_x, h-1))
+            if len(points) >= 2:
+                fit_lines.append((points[0], points[1]))
+
+        # 2. Find all intersections
+        def line_intersection(line1, line2):
+            (x1, y1), (x2, y2) = line1
+            (x3, y3), (x4, y4) = line2
+            denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+            if denom == 0:
+                return None  # Parallel lines
+            px = ((x1*y2 - y1*x2)*(x3 - x4) - (x1 - x2)*(x3*y4 - y3*x4)) / denom
+            py = ((x1*y2 - y1*x2)*(y3 - y4) - (y1 - y2)*(x3*y4 - y3*x4)) / denom
+            return (px, py)
+
+        intersections = []
+        line_to_intersections = [[] for _ in fit_lines]
+        for i in range(len(fit_lines)):
+            for j in range(i+1, len(fit_lines)):
+                pt = line_intersection(fit_lines[i], fit_lines[j])
+                if pt is not None:
+                    intersections.append((int(round(pt[0])), int(round(pt[1]))))
+                    line_to_intersections[i].append(pt)
+                    line_to_intersections[j].append(pt)
+
+        # 3. For each line, trim to its intersection points
+        trimmed_lines = []
+        for idx, (pt1, pt2) in enumerate(fit_lines):
+            pts = line_to_intersections[idx]
+            if len(pts) < 2:
+                # Not enough intersections, keep as is
+                trimmed_lines.append((pt1, pt2))
+                continue
+            # Project intersection points onto the line, sort by distance along the line
+            [vx, vy] = np.array(pt2) - np.array(pt1)
+            norm = np.hypot(vx, vy)
+            if norm == 0:
+                trimmed_lines.append((pt1, pt2))
+                continue
+            vx, vy = vx / norm, vy / norm
+            def proj_t(pt):
+                return (pt[0] - pt1[0]) * vx + (pt[1] - pt1[1]) * vy
+            pts_sorted = sorted(pts, key=proj_t)
+            trimmed_lines.append((tuple(map(int, map(round, pts_sorted[0]))),
+                                  tuple(map(int, map(round, pts_sorted[-1])))))
+
+        self.skeleton_fit_lines = trimmed_lines
+        self.skeleton_fit_intersections = [tuple(map(int, map(round, pt))) for pt in intersections]  
+
+
+
+
+
+
+
+
+
+
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    set_dark_mode(app)
     win = FloodFillApp()
     win.show()
     sys.exit(app.exec_())
-

@@ -11,6 +11,7 @@ import pytesseract
 import cv2
 import numpy as np
 import re
+import itertools
 
 class ImageViewer(QGraphicsView):
     def __init__(self):
@@ -431,6 +432,22 @@ class MainWindow(QMainWindow):
             adj = cv2.dilate(adj, kernel, iterations=dilation_iter)
         return adj
 
+    def preprocess_for_ocr_params(self, arr, brightness, contrast, threshold, gaussian):
+        gray = cv2.cvtColor(arr, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        eq = clahe.apply(gray)
+        alpha = contrast / 100.0
+        beta = brightness
+        adj = cv2.convertScaleAbs(eq, alpha=alpha, beta=beta)
+        gaussian_ksize = gaussian
+        if gaussian_ksize % 2 == 0:
+            gaussian_ksize += 1
+        if gaussian_ksize > 1:
+            adj = cv2.GaussianBlur(adj, (gaussian_ksize, gaussian_ksize), 0)
+        if threshold > 0:
+            _, adj = cv2.threshold(adj, threshold, 255, cv2.THRESH_BINARY)
+        return adj
+
     def get_current_image_array(self):
         """Get the current image as a numpy array, applying invert if needed."""
         if not self._last_pixmap:
@@ -530,12 +547,10 @@ class MainWindow(QMainWindow):
         threshold_range = range(0, 201, 50)
         gaussian_range = range(0, 7, 2)
 
-        total_combinations = (
-            len(brightness_range) *
-            len(contrast_range) *
-            len(threshold_range) *
-            len(gaussian_range)
-        )
+        param_combinations = list(itertools.product(
+            brightness_range, contrast_range, threshold_range, gaussian_range
+        ))
+        total_combinations = len(param_combinations)
         attempt = 0
         found_new_distance = False
         found_new_bearing = False
@@ -547,166 +562,74 @@ class MainWindow(QMainWindow):
             print("No image loaded.")
             return
 
+        sliders = [
+            self.brightness_slider, self.contrast_slider, self.erosion_slider,
+            self.dilation_slider, self.threshold_slider, self.gaussian_slider,
+            self.merge_x_slider, self.merge_y_slider
+        ]
+        for slider in sliders:
+            slider.blockSignals(True)
+            slider.setVisible(False)
+
         def update_progress():
-            if found_new_distance and found_new_bearing:
-                self.progress_bar.setValue(100)
-                self.progress_bar.setFormat("Attempts: {}/{} (Done)".format(attempt, total_combinations))
-            elif found_new_distance or found_new_bearing:
-                self.progress_bar.setValue(50)
-                self.progress_bar.setFormat("Attempts: {}/{} (Halfway)".format(attempt, total_combinations))
-            else:
-                percent = int((attempt / total_combinations) * 50)
-                self.progress_bar.setValue(percent)
-                self.progress_bar.setFormat("Attempts: {}/{} (Searching)".format(attempt, total_combinations))
+            percent = int((attempt / total_combinations) * 100)
+            self.progress_bar.setValue(percent)
+            self.progress_bar.setFormat(f"Attempts: {attempt}/{total_combinations}")
             QApplication.processEvents()
 
-        # --- Step 1: Find a new valid distance or bearing ---
-        for brightness in brightness_range:
-            self.brightness_slider.setValue(brightness)
-            for contrast in contrast_range:
-                self.contrast_slider.setValue(contrast)
-                for threshold in threshold_range:
-                    self.threshold_slider.setValue(threshold)
-                    for gaussian in gaussian_range:
-                        self.gaussian_slider.setValue(gaussian)
-                        attempt += 1
-                        pre = self.preprocess_for_ocr(orig_arr)
-                        custom_config = r'--oem 3 --psm 6 -c tessedit_char_whitelist=NWSE.0123456789'
-                        data = pytesseract.image_to_data(pre, output_type=pytesseract.Output.DICT, config=custom_config)
-                        for i in range(len(data['text'])):
-                            text = data['text'][i]
-                            if not (text and any(c.isalnum() for c in text)):
-                                continue
-                            selected = text.replace(' ', '')
-                            selected = re.sub(r'^(EE)', 'E', selected)
-                            selected = re.sub(r'^(WW)', 'W', selected)
-                            selected = re.sub(r'^(NN)', 'N', selected)
-                            selected = re.sub(r'^(SS)', 'S', selected)
-                            if selected and selected[0] in 'NWSE' and '.' in selected:
-                                selected = selected.replace('.', '')
-                            if selected and not (selected[0] in 'NWSE' or selected[0].isdigit()):
-                                m = re.search(r'[0-9]', selected)
-                                if m:
-                                    selected = selected[m.start():]
-                            is_decimal = bool(re.match(r'^\d*\.\d+$', selected))
-                            is_bearing = selected and selected[0] in 'NWSE' and len(selected) >= 6
-                            if is_decimal and not found_new_distance and selected not in self.viewer.distances:
-                                new_distance = selected
-                                self.viewer.distances.append(selected)
-                                found_new_distance = True
-                                print(f"New distance found: {new_distance}")
-                                print("All distances:", self.viewer.distances)
-                            if is_bearing and not found_new_bearing and selected not in self.viewer.bearings:
-                                if len(selected) > 8:
-                                    continue  # Ignore bearings over 8 characters
-                                if any(x in selected for x in ("EE", "WW", "NN", "SS")):
-                                    continue  # Ignore bearings containing invalid substrings
-                                if not selected[-1] in ("E", "W"):
-                                    continue  # Last character must be E or W
-                                if selected[-1].isdigit():
-                                    continue  # Last character cannot be a digit
-                                new_bearing = selected
-                                self.viewer.bearings.append(selected)
-                                found_new_bearing = True
-                                print(f"New bearing found: {new_bearing}")
-                                print("All bearings:", self.viewer.bearings)
-                        update_progress()
-                        if found_new_distance and found_new_bearing:
-                            update_progress()
-                            return  # Both found, exit function
+        for brightness, contrast, threshold, gaussian in param_combinations:
+            attempt += 1
+            pre = self.preprocess_for_ocr_params(orig_arr, brightness, contrast, threshold, gaussian)
+            custom_config = r'--oem 3 --psm 6 -c tessedit_char_whitelist=NWSE.0123456789'
+            data = pytesseract.image_to_data(pre, output_type=pytesseract.Output.DICT, config=custom_config)
+            for i in range(len(data['text'])):
+                text = data['text'][i]
+                if not (text and any(c.isalnum() for c in text)):
+                    continue
+                selected = text.replace(' ', '')
+                selected = re.sub(r'^(EE)', 'E', selected)
+                selected = re.sub(r'^(WW)', 'W', selected)
+                selected = re.sub(r'^(NN)', 'N', selected)
+                selected = re.sub(r'^(SS)', 'S', selected)
+                if selected and selected[0] in 'NWSE' and '.' in selected:
+                    selected = selected.replace('.', '')
+                if selected and not (selected[0] in 'NWSE' or selected[0].isdigit()):
+                    m = re.search(r'[0-9]', selected)
+                    if m:
+                        selected = selected[m.start():]
+                is_decimal = bool(re.match(r'^\d*\.\d+$', selected))
+                is_bearing = selected and selected[0] in 'NWSE' and len(selected) >= 6
+                if is_decimal and not found_new_distance and selected not in self.viewer.distances:
+                    new_distance = selected
+                    self.viewer.distances.append(selected)
+                    found_new_distance = True
+                    print(f"New distance found: {new_distance}")
+                    print("All distances:", self.viewer.distances)
+                if is_bearing and not found_new_bearing and selected not in self.viewer.bearings:
+                    if len(selected) > 8:
+                        continue
+                    if any(x in selected for x in ("EE", "WW", "NN", "SS")):
+                        continue
+                    if not selected[-1] in ("E", "W"):
+                        continue
+                    if selected[-1].isdigit():
+                        continue
+                    new_bearing = selected
+                    self.viewer.bearings.append(selected)
+                    found_new_bearing = True
+                    print(f"New bearing found: {new_bearing}")
+                    print("All bearings:", self.viewer.bearings)
+            if attempt % 10 == 0 or found_new_distance or found_new_bearing:
+                update_progress()
+            if found_new_distance and found_new_bearing:
+                break
 
-        # If only one was found, keep searching for the other
-        if found_new_distance and not found_new_bearing:
-            for brightness in brightness_range:
-                self.brightness_slider.setValue(brightness)
-                for contrast in contrast_range:
-                    self.contrast_slider.setValue(contrast)
-                    for threshold in threshold_range:
-                        self.threshold_slider.setValue(threshold)
-                        for gaussian in gaussian_range:
-                            self.gaussian_slider.setValue(gaussian)
-                            attempt += 1
-                            pre = self.preprocess_for_ocr(orig_arr)
-                            custom_config = r'--oem 3 --psm 6 -c tessedit_char_whitelist=NWSE.0123456789'
-                            data = pytesseract.image_to_data(pre, output_type=pytesseract.Output.DICT, config=custom_config)
-                            for i in range(len(data['text'])):
-                                text = data['text'][i]
-                                if not (text and any(c.isalnum() for c in text)):
-                                    continue
-                                selected = text.replace(' ', '')
-                                selected = re.sub(r'^(EE)', 'E', selected)
-                                selected = re.sub(r'^(WW)', 'W', selected)
-                                selected = re.sub(r'^(NN)', 'N', selected)
-                                selected = re.sub(r'^(SS)', 'S', selected)
-                                if selected and selected[0] in 'NWSE' and '.' in selected:
-                                    selected = selected.replace('.', '')
-                                if selected and not (selected[0] in 'NWSE' or selected[0].isdigit()):
-                                    m = re.search(r'[0-9]', selected)
-                                    if m:
-                                        selected = selected[m.start():]
-                                is_bearing = selected and selected[0] in 'NWSE' and len(selected) >= 6
-                                if is_bearing and selected not in self.viewer.bearings:
-                                    if len(selected) > 8:
-                                        continue
-                                    if any(x in selected for x in ("EE", "WW", "NN", "SS")):
-                                        continue
-                                    if not selected[-1] in ("E", "W"):
-                                        continue
-                                    if selected[-1].isdigit():
-                                        continue
-                                    new_bearing = selected
-                                    self.viewer.bearings.append(selected)
-                                    found_new_bearing = True
-                                    print(f"New bearing found: {new_bearing}")
-                                    print("All bearings:", self.viewer.bearings)
-                            update_progress()
-                            if found_new_bearing:
-                                update_progress()
-                                return  # Both found, exit function
+        for slider in sliders:
+            slider.blockSignals(False)
+            slider.setVisible(True)
+        self.connect_sliders(self.highlight_text)
 
-        elif found_new_bearing and not found_new_distance:
-            for brightness in brightness_range:
-                self.brightness_slider.setValue(brightness)
-                for contrast in contrast_range:
-                    self.contrast_slider.setValue(contrast)
-                    for threshold in threshold_range:
-                        self.threshold_slider.setValue(threshold)
-                        for gaussian in gaussian_range:
-                            self.gaussian_slider.setValue(gaussian)
-                            attempt += 1
-                            pre = self.preprocess_for_ocr(orig_arr)
-                            custom_config = r'--oem 3 --psm 6 -c tessedit_char_whitelist=NWSE.0123456789'
-                            data = pytesseract.image_to_data(pre, output_type=pytesseract.Output.DICT, config=custom_config)
-                            for i in range(len(data['text'])):
-                                text = data['text'][i]
-                                if not (text and any(c.isalnum() for c in text)):
-                                    continue
-                                selected = text.replace(' ', '')
-                                selected = re.sub(r'^(EE)', 'E', selected)
-                                selected = re.sub(r'^(WW)', 'W', selected)
-                                selected = re.sub(r'^(NN)', 'N', selected)
-                                selected = re.sub(r'^(SS)', 'S', selected)
-                                if selected and selected[0] in 'NWSE' and '.' in selected:
-                                    selected = selected.replace('.', '')
-                                if selected and not (selected[0] in 'NWSE' or selected[0].isdigit()):
-                                    m = re.search(r'[0-9]', selected)
-                                    if m:
-                                        selected = selected[m.start():]
-                                is_decimal = bool(re.match(r'^\d*\.\d+$', selected))
-                                if is_decimal and selected not in self.viewer.distances:
-                                    new_distance = selected
-                                    self.viewer.distances.append(selected)
-                                    found_new_distance = True
-                                    print(f"New distance found: {new_distance}")
-                                    print("All distances:", self.viewer.distances)
-                            update_progress()
-                            if found_new_distance:
-                                update_progress()
-                                return  # Both found, exit function
-
-        # Final update
         update_progress()
-
         if not found_new_distance and not found_new_bearing:
             self.viewer.bearings = original_bearings
             self.viewer.distances = original_distances
@@ -717,7 +640,6 @@ class MainWindow(QMainWindow):
             print("Auto-find complete: new distance found, no new bearing.")
         elif found_new_bearing:
             print("Auto-find complete: new bearing found, no new distance.")
-
 def set_dark_mode(app):
     dark_palette = QPalette()
     dark_palette.setColor(QPalette.Window, QColor(30, 30, 30))
