@@ -4,7 +4,7 @@
     <SchemaVersion>2.0</SchemaVersion>
     <ProjectGuid>124c00cb-fb0b-4f47-b982-bd302903dc3b</ProjectGuid>
     <ProjectHome>.</ProjectHome>
-    <StartupFile>OCR.Testing_LATEST.py</StartupFile>
+    <StartupFile>SMSresponse.py</StartupFile>
     <SearchPath>
     </SearchPath>
     <WorkingDirectory>.</WorkingDirectory>
@@ -23,6 +23,7 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="SeedPointFillToMaskImageOut.py" />
+    <Compile Include="SMSresponse.py" />
   </ItemGroup>
   <ItemGroup>
     <Content Include="OCR.Testing_LATEST.py" />
