@@ -431,6 +431,10 @@ class FloodFillApp(QMainWindow):
         else:
             prep_img = flood_source
 
+        # NEW: reduce outer contour complexity by spanning gaps using a convex hull derived from a dilated mask
+        # Start with a span of gap_px * 6, can be tuned later if needed.
+        # self.Create_Concave_Hull(gap_px * 6)
+
         # === 4) Barriers (brown lines) ===
         if self.brown_lines:
             for pt1, pt2 in self.brown_lines:
@@ -637,18 +641,116 @@ class FloodFillApp(QMainWindow):
             self.mask_age[addition > 0] = 0
             self.mask = cv2.bitwise_or(self.mask, addition)
 
+        # NEW: modify the fill area using a concave hull after bridging logic
+        # self.build_concave_hull_from_mask(alpha_factor = 2.2)
+
+        # === Bridge outer boundary over near-parallel text defects (outside strip) ===
+        # self.bridge_outer_boundary_over_text(gap_px)
+        self.bridge_outer_boundary_over_text(
+            gap_px, 
+            dilate_strip_iters=12, 
+            ransac_residual=1.6, 
+            min_line_len_px=40, 
+            band_thick=14, 
+            guide_thick=6, 
+            close_iters=12, 
+            finalize_max_dev_px=16)
+
+
         # === 7) Local cleanup (closing) ===
-        local_radius = max(1, gap_px)
+        # You can keep a lighter close here or skip if the bridge step is sufficient.
+        base = max(1, gap_px)
+        local_radius = int(np.clip(base, 2, 12))
         se_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * local_radius + 1, 2 * local_radius + 1))
         pre_close_mask = (self.mask > 0)
-        closed = cv2.morphologyEx(self.mask, cv2.MORPH_CLOSE, se_close)
+        closed = cv2.morphologyEx(self.mask.copy(), cv2.MORPH_CLOSE, se_close, iterations=1)
         envelope = cv2.dilate(self.mask, se_close, iterations=1)
         self.mask = cv2.bitwise_and(closed, envelope)
+        # ... keep your barrier protection and age tracking that follow ...
+
+        # 7c) Detect long straight runs on the current outer contour
+        mask_u8_tmp = (self.mask > 0).astype(np.uint8) * 255
+        ctrs_tmp, _ = cv2.findContours(mask_u8_tmp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        if ctrs_tmp:
+            ref_outer = max(ctrs_tmp, key=cv2.contourArea)
+            ref_pts = ref_outer.reshape(-1, 2).astype(np.float32)
+            win = max(60, local_radius * 8)   # window length for fitting
+            step = max(12, win // 3)
+            ransac_residual = 1.5
+            min_line_len_px = max(100, local_radius * 12)
+
+            detected_lines = []  # [(p1, p2), ...]
+            try:
+                from skimage.measure import LineModelND, ransac
+                N = ref_pts.shape[0]
+                for start in range(0, N, step):
+                    end = min(N, start + win)
+                    seg = ref_pts[start:end]
+                    if seg.shape[0] < 2:
+                        continue
+                    model, inliers = ransac(seg, LineModelND, min_samples=2,
+                                            residual_threshold=ransac_residual, max_trials=100)
+                    if model is None or not np.any(inliers):
+                        continue
+                    inlier_pts = seg[inliers]
+                    t_vals = np.dot(inlier_pts - model.params[0], model.params[1])
+                    t_min, t_max = float(np.min(t_vals)), float(np.max(t_vals))
+                    p1 = (model.params[0] + t_min * model.params[1]).astype(np.float32)
+                    p2 = (model.params[0] + t_max * model.params[1]).astype(np.float32)
+                    if float(np.linalg.norm(p2 - p1)) >= float(min_line_len_px):
+                        detected_lines.append((tuple(p1.astype(int)), tuple(p2.astype(int))))
+            except Exception:
+                detected_lines = []
+
+            # 7d) Build a suppression band along the detected long lines
+            if detected_lines:
+                band_thick = max(7, local_radius)  # band width around long lines
+                longline_band = np.zeros_like(self.mask, dtype=np.uint8)
+                for p1, p2 in detected_lines:
+                    cv2.line(longline_band, p1, p2, 255, thickness=band_thick)
+                # Expand band a bit to catch text strokes near the boundary
+                longline_band = cv2.dilate(longline_band, se_close, iterations=1)
+
+                # Compute envelope and polygons of the outer contour for inside/outside tests
+                envelope = cv2.dilate(self.mask, se_close, iterations=1)
+                env_u8 = (envelope > 0).astype(np.uint8) * 255
+
+                # Remove pixels in the band that are outside the current outer contour but within envelope
+                # Signatures of parallel text near boundary often lie in this "outside within envelope" region.
+                outside_current = cv2.bitwise_and(env_u8, cv2.bitwise_not(mask_u8_tmp))
+                suppress_candidates = cv2.bitwise_and(outside_current, longline_band)
+                # Subtract suppress_candidates from envelope to avoid closing into these false positives
+                env_after_suppress = cv2.bitwise_and(env_u8, cv2.bitwise_not(suppress_candidates))
+
+                # 7e) Perform closing while respecting the suppressed envelope
+                closed = cv2.morphologyEx(self.mask.copy(), cv2.MORPH_CLOSE, se_close, iterations=1)
+                self.mask = cv2.bitwise_and(closed, env_after_suppress)
+            else:
+                # Fallback: original close+envelope combine
+                closed = cv2.morphologyEx(self.mask.copy(), cv2.MORPH_CLOSE, se_close, iterations=1)
+                envelope = cv2.dilate(self.mask, se_close, iterations=1)
+                self.mask = cv2.bitwise_and(closed, envelope)
+        else:
+            # No outer contour; just run close+envelope
+            closed = cv2.morphologyEx(self.mask.copy(), cv2.MORPH_CLOSE, se_close, iterations=1)
+            envelope = cv2.dilate(self.mask, se_close, iterations=1)
+            self.mask = cv2.bitwise_and(closed, envelope)
+
+        # 7f) Optional: protect around barriers (brown lines)
+        if self.brown_lines:
+            protect = np.zeros_like(self.mask, dtype=np.uint8)
+            for pt1, pt2 in self.brown_lines:
+                cv2.line(protect, (int(pt1[0]), int(pt1[1])), (int(pt2[0]), int(pt2[1])),
+                         255, thickness=max(3, local_radius))
+            protect = cv2.dilate(protect, se_close, iterations=1)
+            self.mask[protect > 0] = self.mask[protect > 0] & pre_close_mask[protect > 0]
+
+        # 7g) Age tracking
         post_mask = (self.mask > 0)
         closed_added = post_mask & (~pre_close_mask)
         if np.any(closed_added):
             self.mask_age[closed_added] = 0
-        removed = (~post_mask) & (existing_before | (self.mask_age > 0))
+        removed = (~post_mask) & (pre_close_mask | (self.mask_age > 0))
         if np.any(removed):
             self.mask_age[removed] = 0
 
@@ -811,7 +913,7 @@ class FloodFillApp(QMainWindow):
             if self.decimated_contour is None:
                 mask_for_contours = (self.mask > 0).astype(np.uint8) * 255
                 contours, _ = cv2.findContours(mask_for_contours, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                cv2.drawContours(flood_img, contours, -1, (0, 255, 0), 2)  # Green contours
+                cv2.drawContours(flood_img, contours, -1, (0, 255, 0), 1)  # Green contours
 
         # Draw simplified (decimated) contour if it exists
         if self.decimated_contour is not None:
@@ -2216,6 +2318,483 @@ class FloodFillApp(QMainWindow):
 
         self.update_canvas_image()
         self.statusBar().showMessage(f"Kernel sweep (descending): k={chosen_k}, perimeter={peri_c:.0f}, area={area_c:.0f}")
+
+    def finalize_decimated_contour(
+        self,
+        decimated: np.ndarray,
+        outer: np.ndarray,
+        max_deviation_px: float = 6.0,
+        dedup_distance_px: float = 1.0,
+        use_segment_projection: bool = True,
+        adaptive_scale: bool = True,
+        perimeter_ref_ratio: float = 0.002  # scales max_deviation_px by outer perimeter
+    ) -> np.ndarray:
+        """
+        Ensure the decimated contour:
+        - stays close to the given outer contour (snap vertices if deviating more than max_deviation_px)
+        - remains closed and avoids successive duplicates.
+
+        decimated: contour Nx1x2 (int32) from approxPolyDP or hull step
+        outer: original outer contour Nx1x2 (int32) used as reference
+        max_deviation_px: max allowed deviation; vertices farther than this are snapped to nearest outer point.
+
+        Returns a corrected, closed contour (Nx1x2 int32).
+        """
+        if decimated is None or len(decimated) == 0:
+            return decimated
+        if outer is None or len(outer) == 0:
+            dec = decimated.copy()
+            if not np.array_equal(dec[0][0], dec[-1][0]):
+                dec = np.vstack([dec, [dec[0]]])
+            return dec
+
+        # Flatten
+        dec_pts = decimated.reshape(-1, 2).astype(np.float32)
+        outer_pts = outer.reshape(-1, 2).astype(np.float32)
+
+        # Optional adaptive scaling based on perimeter
+        if adaptive_scale:
+            peri = float(cv2.arcLength(outer, True))
+            # Example: increase allowed deviation slightly on very large contours
+            max_dev_eff = max_deviation_px + perimeter_ref_ratio * peri
+        else:
+            max_dev_eff = max_deviation_px
+
+        # Precompute segment list for projection snapping
+        def project_to_segments(pt, segments):
+            best_proj = None
+            best_d2 = float('inf')
+            for a, b in segments:
+                ab = b - a
+                denom = float(np.dot(ab, ab))
+                if denom == 0.0:
+                    # degenerate segment
+                    d2 = float(np.sum((pt - a) ** 2))
+                    if d2 < best_d2:
+                        best_d2 = d2
+                        best_proj = a
+                    continue
+                t = float(np.clip(np.dot(pt - a, ab) / denom, 0.0, 1.0))
+                proj = a + t * ab
+                d2 = float(np.sum((pt - proj) ** 2))
+                if d2 < best_d2:
+                    best_d2 = d2
+                    best_proj = proj
+            return best_proj, best_d2
+
+        segments = list(zip(outer_pts[:-1], outer_pts[1:]))
+        # Ensure closed segments
+        if not np.array_equal(outer_pts[0], outer_pts[-1]):
+            segments.append((outer_pts[-1], outer_pts[0]))
+
+        snapped = dec_pts.copy()
+        # Prefer fast FLANN nearest for a coarse candidate
+        use_flann = True
+        flann = None
+        if use_flann:
+            try:
+                index_params = dict(algorithm=1, trees=4)  # FLANN_INDEX_KDTREE
+                search_params = dict(checks=32)
+                flann = cv2.flann_Index(outer_pts, index_params)
+                _, idxs, dists = flann.knnSearch(dec_pts, 1, params=search_params)
+                dists = dists.flatten()  # squared distances
+            except Exception:
+                flann = None
+
+        for i, p in enumerate(dec_pts):
+            if flann is not None:
+                d2_nn = float(dists[i])
+                nn_outer = outer_pts[idxs[i][0]]
+            else:
+                d2_all = np.sum((outer_pts - p) ** 2, axis=1)
+                j = int(np.argmin(d2_all))
+                d2_nn = float(d2_all[j])
+                nn_outer = outer_pts[j]
+
+            # Option 1: snap to nearest vertex
+            snap_target = nn_outer
+            snap_d2 = d2_nn
+
+            # Option 2: snap to nearest point along outer segments (usually smoother)
+            if use_segment_projection:
+                proj, proj_d2 = project_to_segments(p, segments)
+                if proj is not None and proj_d2 < snap_d2:
+                    snap_target = proj
+                    snap_d2 = proj_d2
+
+            if snap_d2 > (max_dev_eff ** 2):
+                # Only snap when deviation exceeds threshold (enforce adherence)
+                snapped[i] = snap_target
+
+        # Remove successive duplicates with configurable tolerance
+        dedup = [snapped[0]]
+        for p in snapped[1:]:
+            if np.linalg.norm(p - dedup[-1]) >= dedup_distance_px:
+                dedup.append(p)
+        dedup = np.array(dedup, dtype=np.int32)
+
+        # Ensure closed
+        if not np.array_equal(dedup[0], dedup[-1]):
+            dedup = np.vstack([dedup, dedup[0]])
+
+        return dedup.reshape(-1, 1, 2)
+
+    def simplify_and_finalize(self, outer_contour: np.ndarray, epsilon_ratio: float = 0.001, max_dev_px: float = 8.0) -> np.ndarray:
+        """
+        Run approxPolyDP with adaptive epsilon, then finalize against the outer contour.
+        - epsilon_ratio: fraction of arc length for approxPolyDP epsilon (0.008–0.02 typical).
+        - max_dev_px: maximum deviation when snapping back to the outer contour.
+        """
+        if outer_contour is None or len(outer_contour) == 0:
+            return None
+        eps = max(1, epsilon_ratio * cv2.arcLength(outer_contour, True))
+        #eps = 8 # testing for appropriate values
+        dec = cv2.approxPolyDP(outer_contour, eps, True)
+        dec = self.finalize_decimated_contour(dec, outer_contour, max_deviation_px=max_dev_px)
+        return dec
+
+    def build_concave_hull_from_mask(self, alpha_factor: float = 1.0):
+        """
+        Compute a concave hull (alpha shape) from current mask's largest external contour.
+        Produces a simplified, closed contour close to the original outer contour.
+        Updates:
+          - self.decimated_contour: finalized simplified closed contour.
+        Params:
+          - alpha_factor: scales the inferred alpha (lower -> smoother; higher -> more concavity).
+        """
+        if self.mask is None or np.count_nonzero(self.mask) == 0:
+            return
+
+        mask_u8 = (self.mask > 0).astype(np.uint8) * 255
+        contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        if not contours:
+            return
+
+        outer = max(contours, key=cv2.contourArea)
+
+        # If very few points, fallback to simplified outer
+        pts = outer.reshape(-1, 2).astype(np.float64)
+        if pts.shape[0] < 4:
+            dec = self.simplify_and_finalize(outer, epsilon_ratio=0.01, max_dev_px=6.0)
+            self.decimated_contour = dec
+            return
+
+        try:
+            from scipy.spatial import Delaunay
+            tri = Delaunay(pts)
+
+            def edge_lengths(tri_pts):
+                a = np.linalg.norm(tri_pts[0] - tri_pts[1])
+                b = np.linalg.norm(tri_pts[1] - tri_pts[2])
+                c = np.linalg.norm(tri_pts[2] - tri_pts[0])
+                return a, b, c
+
+            tri_pts = pts[tri.simplices]
+            med_edges = []
+            for t in tri_pts:
+                a, b, c = edge_lengths(t)
+                med_edges.append(np.median([a, b, c]))
+            if len(med_edges) == 0:
+                # Fallback to simplified outer
+                # Preserve detail
+                self.decimated_contour = self.simplify_and_finalize(oc, epsilon_ratio=0.01, max_dev_px=5.0)
+                return
+
+            base_alpha = np.median(med_edges)
+            alpha = base_alpha * alpha_factor if alpha_factor > 0 else base_alpha
+
+            kept = []
+            for t in tri_pts:
+                a, b, c = edge_lengths(t)
+                if a <= alpha and b <= alpha and c <= alpha:
+                    kept.append(t)
+
+            # Rasterize kept triangles into an intermediate hull mask
+            concave_mask = np.zeros_like(mask_u8, dtype=np.uint8)
+            for t in kept:
+                tri_int = np.round(t).astype(np.int32)
+                cv2.fillConvexPoly(concave_mask, tri_int, 255)
+
+            concave_mask = cv2.morphologyEx(concave_mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+
+            final_contours, _ = cv2.findContours(concave_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not final_contours:
+                # Fallback: simplified outer
+                self.decimated_contour = self.simplify_and_finalize(outer, epsilon_ratio=0.01, max_dev_px=6.0)
+                return
+
+            final_outer = max(final_contours, key=cv2.contourArea)
+
+            # Simplify and finalize against original outer to stay close and ensure closure
+            dec = self.simplify_and_finalize(final_outer, epsilon_ratio=0.01, max_dev_px=6.0)
+            self.decimated_contour = dec
+
+        except Exception:
+            # SciPy unavailable or triangulation failed: fallback to simplified outer
+            self.decimated_contour = self.simplify_and_finalize(outer, epsilon_ratio=0.01, max_dev_px=6.0)
+
+    def Create_GapBridged_Contour(self, span_px: int, epsilon_ratio: float = 0.01, dilate_iters: int = 1, max_dev_px: float = 6.0):
+        """
+        Reduce outer contour complexity by bridging small gaps via mask dilation (no concave hull).
+        span_px: dilation kernel size (controls how far gaps are bridged).
+        epsilon_ratio: approxPolyDP epsilon as fraction of perimeter (controls straightening/simplification).
+        dilate_iters: number of dilation iterations (amplifies bridging distance).
+        max_dev_px: snapping tolerance used in finalize (higher = straighter after simplify).
+        """
+        if self.mask is None or np.count_nonzero(self.mask) == 0:
+            return
+
+        mask_u8 = (self.mask > 0).astype(np.uint8) * 255
+        ref_contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        if not ref_contours:
+            return
+        ref_outer = max(ref_contours, key=cv2.contourArea)
+
+        # 1) Dilate to bridge gaps
+        k = max(1, int(span_px))
+        kernel = np.ones((k, k), np.uint8)
+        bridged_mask = cv2.dilate(mask_u8, kernel, iterations=max(1, int(dilate_iters)))
+
+        # 2) Largest external contour on the bridged mask
+        contours, _ = cv2.findContours(bridged_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            dec = self.simplify_and_finalize(ref_outer, epsilon_ratio=epsilon_ratio, max_dev_px=max_dev_px)
+            self.decimated_contour = dec
+            return
+        bridged_outer = max(contours, key=cv2.contourArea)
+
+        # 3) Simplify and finalize (keeps contour close and closed)
+        dec = self.simplify_and_finalize(bridged_outer, epsilon_ratio=epsilon_ratio, max_dev_px=max_dev_px)
+        self.decimated_contour = dec
+
+    def Enforce_Long_Line_Alignment(self, max_snap_dist_px: float = 8.0, min_line_len_px: int = 40, ransac_residual: float = 1.5):
+        """
+        Enforce alignment of the simplified contour to long straight segments detected on the reference outer contour.
+        - Finds long lines via RANSAC on points of the largest external contour of current mask.
+        - Snaps decimated contour vertices to the nearest detected line if within max_snap_dist_px.
+        - Ensures closure and removes successive duplicates.
+
+        max_snap_dist_px: max distance to allow snapping a vertex to a line.
+        min_line_len_px: minimum geometric length for a detected line to be considered 'long'.
+        ransac_residual: residual threshold for RANSAC line fitting (lower is stricter).
+        """
+        if self.decimated_contour is None or self.mask is None or np.count_nonzero(self.mask) == 0:
+            return
+
+        # Reference outer contour from current mask
+        mask_u8 = (self.mask > 0).astype(np.uint8) * 255
+        contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        if not contours:
+            return
+        ref_outer = max(contours, key=cv2.contourArea)
+
+        # Prepare points for line detection
+        ref_pts = ref_outer.reshape(-1, 2).astype(np.float32)
+        if ref_pts.shape[0] < 2:
+            return
+
+        # Detect long lines using RANSAC clusters over local windows
+        # Strategy: sample segments along ref contour and fit lines on sliding windows to capture dominant straight runs.
+        from skimage.measure import LineModelND, ransac
+
+        # Sliding window params
+        win = max(30, min_line_len_px)  # ensure enough points per window
+        step = max(10, win // 3)
+
+        detected_lines = []  # list of (p1, p2, n, d) with endpoints p1,p2; unit direction n; vec origin d
+        N = ref_pts.shape[0]
+        for start in range(0, N, step):
+            end = min(N, start + win)
+            seg = ref_pts[start:end]
+            if seg.shape[0] < 2:
+                continue
+            try:
+                model, inliers = ransac(seg, LineModelND, min_samples=2, residual_threshold=ransac_residual, max_trials=100)
+            except Exception:
+                continue
+            if model is None:
+                continue
+            inlier_pts = seg[inliers]
+            if inlier_pts.shape[0] < 2:
+                continue
+            # Compute endpoints along the fitted line
+            t_vals = np.dot(inlier_pts - model.params[0], model.params[1])
+            t_min, t_max = float(np.min(t_vals)), float(np.max(t_vals))
+            p1 = (model.params[0] + t_min * model.params[1]).astype(np.float32)
+            p2 = (model.params[0] + t_max * model.params[1]).astype(np.float32)
+            length = float(np.linalg.norm(p2 - p1))
+            if length >= float(min_line_len_px):
+                n = model.params[1] / np.linalg.norm(model.params[1])  # direction unit vector
+                d = model.params[0]  # point on line
+                detected_lines.append((p1, p2, n.astype(np.float32), d.astype(np.float32)))
+
+        if not detected_lines:
+            return
+
+        # Helper: distance point-to-line and projection
+        def point_line_distance_and_projection(pt, n, d):
+            # distance = norm((pt - d) - ((pt - d) dot n) * n)
+            v = pt - d
+            t = float(np.dot(v, n))
+            proj = d + t * n
+            dist = float(np.linalg.norm(v - t * n))
+            return dist, proj
+
+        # Snap decimated contour vertices to nearest long line if within tolerance
+        dec_pts = self.decimated_contour.reshape(-1, 2).astype(np.float32)
+        snapped = dec_pts.copy()
+        for i, p in enumerate(dec_pts):
+            best_dist = max_snap_dist_px
+            best_proj = None
+            for p1, p2, n, d in detected_lines:
+                dist, proj = point_line_distance_and_projection(p, n, d)
+                if dist <= best_dist:
+                    # Optional: ensure projection lies within segment bounding box with margin
+                    xmin, xmax = sorted([p1[0], p2[0]])
+                    ymin, ymax = sorted([p1[1], p2[1]])
+                    margin = 5.0
+                    if (proj[0] >= xmin - margin and proj[0] <= xmax + margin and
+                        proj[1] >= ymin - margin and proj[1] <= ymax + margin):
+                        best_dist = dist
+                        best_proj = proj
+            if best_proj is not None:
+                snapped[i] = best_proj
+
+        # Remove successive duplicates and ensure closure
+        dedup = [snapped[0]]
+        for p in snapped[1:]:
+            if np.linalg.norm(p - dedup[-1]) >= 1.0:
+                dedup.append(p)
+        dedup = np.array(dedup, dtype=np.int32)
+        if not np.array_equal(dedup[0], dedup[-1]):
+            dedup = np.vstack([dedup, dedup[0]])
+
+        self.decimated_contour = dedup.reshape(-1, 1, 2)
+
+    def bridge_outer_boundary_over_text(
+        self,
+        gap_px: int,
+        dilate_strip_iters: int = 2,
+        ransac_residual: float = 1.3,
+        min_line_len_px: int = None,
+        band_thick: int = None,
+        guide_thick: int = None,
+        close_iters: int = 2,
+        finalize_max_dev_px: float = 6.0
+    ):
+        """
+        Bridge the outer boundary contour across near-parallel text defects lying just outside the mask.
+        Tunables:
+        - dilate_strip_iters: widen the outside strip used to detect/suppress text belts.
+        - ransac_residual: residual threshold for long-line detection (lower = stricter).
+        - min_line_len_px: minimum length for a detected boundary line segment.
+        - band_thick: suppression band thickness around detected long lines (outside strip).
+        - guide_thick: thickness of line-guided fill drawn into the envelope.
+        - close_iters: closing iterations when reconnecting the boundary.
+        - finalize_max_dev_px: snapping tolerance when re-simplifying the updated outer contour.
+        """
+        if self.mask is None or np.count_nonzero(self.mask) == 0:
+            return
+
+        mask_u8 = (self.mask > 0).astype(np.uint8) * 255
+        ctrs, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        if not ctrs:
+            return
+        ref_outer = max(ctrs, key=cv2.contourArea)
+
+        # Local scale (base from gap)
+        local_radius = int(np.clip(max(1, gap_px), 2, 12))
+
+        # Derived defaults if not provided
+        if min_line_len_px is None:
+            min_line_len_px = max(60, local_radius * 10)
+        if band_thick is None:
+            band_thick = max(8, local_radius + 3)
+        if guide_thick is None:
+            guide_thick = max(3, local_radius - 1)
+
+        # Build widened outside strip next to the current outer contour
+        se_rect = cv2.getStructuringElement(cv2.MORPH_RECT, (2 * local_radius + 1, 2 * local_radius + 1))
+        dil_wide = cv2.dilate(mask_u8, se_rect, iterations=max(1, int(dilate_strip_iters)))
+        outside_strip = cv2.bitwise_and(dil_wide, cv2.bitwise_not(mask_u8))
+
+        # Detect longer straight outer boundary runs via sliding-window RANSAC
+        ref_pts = ref_outer.reshape(-1, 2).astype(np.float32)
+        win = max(20, local_radius * 10)
+        step = max(16, win // 3)
+
+        detected_lines = []
+        try:
+            from skimage.measure import LineModelND, ransac
+            N = ref_pts.shape[0]
+            for start in range(0, N, step):
+                end = min(N, start + win)
+                seg = ref_pts[start:end]
+                if seg.shape[0] < 2:
+                    continue
+                model, inliers = ransac(
+                    seg, LineModelND, min_samples=2,
+                    residual_threshold=ransac_residual, max_trials=120
+                )
+                if model is None or not np.any(inliers):
+                    continue
+                inlier_pts = seg[inliers]
+                t_vals = np.dot(inlier_pts - model.params[0], model.params[1])
+                t_min, t_max = float(np.min(t_vals)), float(np.max(t_vals))
+                p1 = (model.params[0] + t_min * model.params[1]).astype(np.float32)
+                p2 = (model.params[0] + t_max * model.params[1]).astype(np.float32)
+                if float(np.linalg.norm(p2 - p1)) >= float(min_line_len_px):
+                    detected_lines.append((tuple(p1.astype(int)), tuple(p2.astype(int))))
+        except Exception:
+            pass
+
+        se_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * local_radius + 1, 2 * local_radius + 1))
+
+        if detected_lines:
+            # Thicker suppression band, limited to outside strip
+            longline_band = np.zeros_like(mask_u8, dtype=np.uint8)
+            for p1, p2 in detected_lines:
+                cv2.line(longline_band, p1, p2, 255, thickness=int(band_thick))
+            longline_band = cv2.dilate(longline_band, se_close, iterations=1)
+
+            suppression = cv2.bitwise_and(longline_band, outside_strip)
+
+            # Envelope minus suppression
+            envelope = cv2.dilate(mask_u8, se_close, iterations=1)
+            env_after_suppress = cv2.bitwise_and(envelope, cv2.bitwise_not(suppression))
+
+            # Line-guided fill: rasterize long boundary lines back into the envelope to bridge across the text gap
+            guided = env_after_suppress.copy()
+            for p1, p2 in detected_lines:
+                cv2.line(guided, p1, p2, 255, thickness=int(guide_thick))
+
+            # Close with the guided envelope
+            closed = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, se_close, iterations=int(close_iters))
+            self.mask = cv2.bitwise_and(closed, guided)
+        else:
+            # Fallback: stronger close+envelope
+            closed = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, se_close, iterations=int(close_iters))
+            envelope = cv2.dilate(mask_u8, se_close, iterations=1)
+            self.mask = cv2.bitwise_and(closed, envelope)
+
+        # Optional barrier protection
+        if self.brown_lines:
+            pre_close_mask = (mask_u8 > 0)
+            protect = np.zeros_like(mask_u8, dtype=np.uint8)
+            for pt1, pt2 in self.brown_lines:
+                cv2.line(protect, (int(pt1[0]), int(pt1[1])), (int(pt2[0]), int(pt2[1])),
+                         255, thickness=max(4, local_radius))
+            protect = cv2.dilate(protect, se_close, iterations=1)
+            self.mask[protect > 0] = (pre_close_mask[protect > 0]).astype(np.uint8) * 255
+
+        # # Optional: re-simplify updated outer contour for display fidelity with tunable snapping tolerance
+        # try:
+        #     contours, _ = cv2.findContours(self.mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        #     if contours:
+        #         oc = max(contours, key=cv2.contourArea)
+        #         self.decimated_contour = self.simplify_and_finalize(oc, epsilon_ratio=0.01, max_dev_px=float(finalize_max_dev_px))
+        # except Exception:
+        #     pass
 
 
 ## never remove the following lines  ##

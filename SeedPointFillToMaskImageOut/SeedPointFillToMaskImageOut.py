@@ -162,8 +162,12 @@ class FloodFillApp(QMainWindow):
         button_layout.addWidget(self.measure_button)
 
         self.simplify_contour_button = QPushButton("2 - Create Simplified Contour")
-        self.simplify_contour_button.clicked.connect(self.create_simplified_contour_4)
+        self.simplify_contour_button.clicked.connect(self.create_simplified_contour_5)
         button_layout.addWidget(self.simplify_contour_button)
+
+        self.simplify_contour4_button = QPushButton("Create Simplified Contour 4")
+        self.simplify_contour4_button.clicked.connect(self.create_simplified_contour_4)
+        button_layout.addWidget(self.simplify_contour4_button)
 
         self.export_geotiff_button = QPushButton("5 - Export GeoTIFF")
         self.export_geotiff_button.clicked.connect(self.export_geotiff)
@@ -251,7 +255,8 @@ class FloodFillApp(QMainWindow):
 
         self.simplify_timer = QTimer(self)
         self.simplify_timer.setSingleShot(True)
-        self.simplify_timer.timeout.connect(self.create_simplified_contour)
+        self.simplify_timer.timeout.connect(self.create_simplified_contour_5)
+        self.simplify_timer.timeout.connect(self.create_simplified_contour_4)
 
         # Initialize additional states for simplified contour 2
         self.simplified2_yellow_mask = None
@@ -434,6 +439,22 @@ class FloodFillApp(QMainWindow):
         overlay[self.mask > 0] = [0, 0, 255]  # Red overlay for mask
         blended = cv2.addWeighted(self.original_image, 0.7, overlay, 0.3, 0)
 
+                # --- Expand fill area by reducing kernel size ---
+        initial_gap = max(2, int(self.pixel_slider['slider'].value() - 1))
+        min_gap = 1
+        expanded_mask, final_gap, outer_contour = self.expand_fill_area_until_perimeter(
+            self.mask, initial_gap, min_gap, perimeter_threshold=1.05
+        )
+
+        # Revert Remove_inner_island_by_Gap to previous value (pixel_slider)
+        Remove_inner_island_by_Gap = self.pixel_slider['slider'].value()
+
+        # Use outer_contour for further processing
+        self.mask = expanded_mask
+        self.outer_contour = outer_contour
+
+        # Continue with your existing pipeline (e.g., overlay, contour finding, etc.)
+
         # 3. Find contours in the mask and merge close ones
         mask_for_contours = (self.mask > 0).astype(np.uint8) * 255
         contours, _ = cv2.findContours(mask_for_contours, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -539,7 +560,7 @@ class FloodFillApp(QMainWindow):
         if doc.page_count == 0:
             return
         page = doc.load_page(0)
-        pix = page.get_pixmap(dpi=200)  # 300 is a good starting point, can go higher
+        pix = page.get_pixmap(dpi=400)  # 300 is a good starting point, can go higher
         img = np.frombuffer(pix.samples, dtype=np.uint8).reshape((pix.height, pix.width, pix.n))
 
         if img.shape[2] == 4:
@@ -547,11 +568,45 @@ class FloodFillApp(QMainWindow):
 
         self.image = img
         self.original_image = img.copy()
-        self.zoom_level = 0.5  # Set zoom to 50% on load
+        self.zoom_level = 0.5
         self.pan_x = 0
         self.pan_y = 0
         self.seed_points = []
         self.mask = None
+        self.tk_image = None
+        self.viewport = None
+        self.ocr_candidate_boxes = []
+        self.decimated_contour = None
+        self.decimated_epsilon = None
+        self.line_points = []
+        self.SCALE_FACTOR = None
+        self.PIXEL_SCALE = None
+        self.brown_line_mode = False
+        self.brown_line_points = []
+        self.brown_lines = []
+        self.last_contour_distances = None
+        self.measure_points = []
+        self.simplified2_yellow_mask = None
+        self.simplified2_inner_contour = None
+        self.simplified2_outer_contour = None
+        self.simplified2_main_closed_line = None
+        self.simplified2_approx_closed_line = None
+        self.simplified2_parallel_contours = None
+        self.skeleton_overlay_img = None
+        self.skeleton_fit_lines = []
+        self.simplified4_skeleton_img = None
+        self.simplified4_fitted_lines = []
+        self.simplified4_fitted_curves = []
+        self.simplified4_prominent_contours = []
+        self.simplified4_offset_contour = None
+        self.simplified4_offset_bestfit_groups = []
+        self.scale_segments = []
+        self.outer_contour = None
+        self.concave_points = []
+        self.statusBar().clearMessage()
+        self.table_text.clear()
+        self.distance_label.setText("Right Click Distance Measure: N/A")
+        self.scale_factor_label.setText("Scale Factor: Not set")
        
                 # Auto-fit if image does not fit canvas
         img_h, img_w = self.image.shape[:2]
@@ -702,7 +757,7 @@ class FloodFillApp(QMainWindow):
 
         if hasattr(self, 'simplified4_fitted_lines') and self.simplified4_fitted_lines:
             painter = QPainter(self.canvas.pixmap())
-            pen = QPen(QColor(0, 255, 255), 3)  # Cyan for lines
+            pen = QPen(QColor(0, 255, 0), 3)  # green for lines
             pen.setCapStyle(Qt.RoundCap)
             painter.setPen(pen)
             for pt1, pt2 in self.simplified4_fitted_lines:
@@ -724,18 +779,18 @@ class FloodFillApp(QMainWindow):
             painter.end()
 
                 # Draw Douglas-Peucker prominent skeleton contours (cyan)
-        if hasattr(self, 'simplified4_prominent_contours') and self.simplified4_prominent_contours:
-            painter = QPainter(self.canvas.pixmap())
-            pen = QPen(QColor(0, 255, 255), 3)  # Cyan
-            pen.setCapStyle(Qt.RoundCap)
-            painter.setPen(pen)
-            for contour in self.simplified4_prominent_contours:
-                pts = contour.reshape(-1, 2)
-                for i in range(1, len(pts)):
-                    x1, y1 = self.image_to_canvas_coords(pts[i-1][0], pts[i-1][1])
-                    x2, y2 = self.image_to_canvas_coords(pts[i][0], pts[i][1])
-                    painter.drawLine(x1, y1, x2, y2)
-            painter.end()
+        # if hasattr(self, 'simplified4_prominent_contours') and self.simplified4_prominent_contours:
+        #     painter = QPainter(self.canvas.pixmap())
+        #     pen = QPen(QColor(255, 0, 255), 3)  # Cyan
+        #     pen.setCapStyle(Qt.RoundCap)
+        #     painter.setPen(pen)
+        #     for contour in self.simplified4_prominent_contours:
+        #         pts = contour.reshape(-1, 2)
+        #         for i in range(1, len(pts)):
+        #             x1, y1 = self.image_to_canvas_coords(pts[i-1][0], pts[i-1][1])
+        #             x2, y2 = self.image_to_canvas_coords(pts[i][0], pts[i][1])
+        #             painter.drawLine(x1, y1, x2, y2)
+        #     painter.end()
                 # Draw concave points (magenta circles)
         if hasattr(self, 'concave_points') and self.concave_points:
             painter = QPainter(self.canvas.pixmap())
@@ -744,6 +799,35 @@ class FloodFillApp(QMainWindow):
             for pt in self.concave_points:
                 x, y = self.image_to_canvas_coords(pt[0], pt[1])
                 painter.drawEllipse(QPoint(x, y), 8, 8)
+            painter.end()
+
+            # Draw offset simplified contour as a thin green line
+        if hasattr(self, 'simplified4_offset_contour') and self.simplified4_offset_contour is not None:
+            painter = QPainter(self.canvas.pixmap())
+            pen = QPen(QColor(0, 255, 0), 2)  # Green, thin
+            pen.setCapStyle(Qt.RoundCap)
+            painter.setPen(pen)
+            pts = self.simplified4_offset_contour.reshape(-1, 2)
+            for i in range(1, len(pts)):
+                x1, y1 = self.image_to_canvas_coords(pts[i-1][0], pts[i-1][1])
+                x2, y2 = self.image_to_canvas_coords(pts[i][0], pts[i][1])
+                painter.drawLine(x1, y1, x2, y2)
+            # Close the contour
+            if len(pts) > 2:
+                x1, y1 = self.image_to_canvas_coords(pts[-1][0], pts[-1][1])
+                x2, y2 = self.image_to_canvas_coords(pts[0][0], pts[0][1])
+                painter.drawLine(x1, y1, x2, y2)
+            painter.end()
+
+        if hasattr(self, 'simplified4_offset_bestfit_groups') and self.simplified4_offset_bestfit_groups:
+            painter = QPainter(self.canvas.pixmap())
+            pen = QPen(QColor(255, 128, 0), 2)  # Thin orange
+            pen.setCapStyle(Qt.RoundCap)
+            painter.setPen(pen)
+            for pt1, pt2 in self.simplified4_offset_bestfit_groups:
+                x1, y1 = self.image_to_canvas_coords(pt1[0], pt1[1])
+                x2, y2 = self.image_to_canvas_coords(pt2[0], pt2[1])
+                painter.drawLine(x1, y1, x2, y2)
             painter.end()
 
         #     # Draw skeleton best-fit lines in cyan
@@ -810,7 +894,6 @@ class FloodFillApp(QMainWindow):
         
 
         # Check if skeleton overlay exists and blend if so
-
 
     def clear_canvas(self):
         if hasattr(self, 'original_image') and self.original_image is not None:
@@ -999,106 +1082,549 @@ class FloodFillApp(QMainWindow):
     def update_aggressiveness_value_label(self, v):
         self.aggressiveness_slider['value_label'].setText(str(int(float(v))))
 
-    # def create_simplified_contour(self):
-    #     if self.mask is None or np.count_nonzero(self.mask) == 0:
-    #         return
+    def canvas_to_image_coords(self, x, y):
+        """Convert canvas (widget) coordinates to image coordinates, considering pan and zoom."""
+        canvas_w, canvas_h = self.canvas.width(), self.canvas.height()
+        img_h, img_w = self.original_image.shape[:2]
+        scale = self.zoom_level
+        #do not modify this line - intentional logic
+        new_w = int(img_w * scale)
+        new_h = int(img_h * scale)
+        # Do not modify this line — intentional logic
+        # Calculate top-left of image in canvas 
+        img_x0 = (canvas_w - new_w) // 2 + self.pan_x
+        img_y0 = (canvas_h - new_h) // 2 + self.pan_y
+        # Convert canvas to image coordinates
+        img_x = int((x - img_x0) / scale)
+        img_y = int((y - img_y0) / scale)
+        # Clamp to image bounds
+        img_x = np.clip(img_x, 0, img_w - 1)
+        img_y = np.clip(img_y, 0, img_h - 1)
+        return img_x, img_y
 
-    #     # Dilate mask to move bounds closer to center of black lines
-    #     dilate_amt = max(1, int(round(self.pixel_slider['slider'].value() * 1.23)))
-    #     kernel = np.ones((dilate_amt, dilate_amt), np.uint8)
-    #     mask_dilated = cv2.dilate(self.mask, kernel, iterations=1)
+    @staticmethod
+    def preprocess_roi_for_ocr(roi):
+        # Convert to grayscale
+        if len(roi.shape) == 3 and roi.shape[2] == 3:
+            roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        else:
+            roi_gray = roi
 
-    #     # Apply morphological closing/opening with kernel size from slider
-    #     kernel_size = self.pixel_slider['slider'].value()
-    #     if kernel_size > 1:
-    #         kernel2 = np.ones((kernel_size, kernel_size), np.uint8)
-    #         mask_for_contours = cv2.morphologyEx(mask_dilated, cv2.MORPH_CLOSE, kernel2)
-    #     else:
-    #         mask_for_contours = mask_dilated.copy()
+        # Denoise
+        roi_denoised = cv2.fastNlMeansDenoising(roi_gray, None, h=30, templateWindowSize=7, searchWindowSize=21)
 
-    #     if mask_for_contours.max() > 1:
-    #         mask_for_contours = (mask_for_contours > 0).astype(np.uint8) * 255
-    #     contours, _ = cv2.findContours(mask_for_contours, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
-    #     if not contours:
-    #         return
+        # Sharpen
+        kernel = np.array([[0, -1, 0], [-1, 5,-1], [0, -1, 0]])
+        roi_sharp = cv2.filter2D(roi_denoised, -1, kernel)
 
-    #     # --- JOIN ADJACENT CONTOURS AT ENDPOINTS IF CLOSE ---
-    #     # join_distance = 20  # pixels
-    #     join_distance = kernel_size * 2.5
-    #     merged = [c.squeeze(axis=1) if len(c.shape) == 3 else c for c in contours]
-    #     changed = True
-    #     while changed and len(merged) > 1:
-    #         changed = False
-    #         for i in range(len(merged)):
-    #             for j in range(i + 1, len(merged)):
-    #                 ci, cj = merged[i], merged[j]
-    #                 # Endpoints
-    #                 ends_i = [ci[0], ci[-1]]
-    #                 ends_j = [cj[0], cj[-1]]
-    #                 # Find closest pair of endpoints
-    #                 dists = np.array([[np.linalg.norm(ei - ej) for ej in ends_j] for ei in ends_i])
-    #                 min_idx = np.unravel_index(np.argmin(dists), dists.shape)
-    #                 if dists[min_idx] < join_distance:
-    #                     # Merge contours at closest endpoints
-    #                     ei_idx, ej_idx = min_idx
-    #                     # Reverse as needed to join ends
-    #                     if ei_idx == 0:
-    #                         ci = ci[::-1]
-    #                     if ej_idx == 1:
-    #                         cj = cj[::-1]
-    #                     # Concatenate, avoid duplicate point
-    #                     new_contour = np.vstack([ci, cj[1:]])
-    #                     # Replace and remove
-    #                     merged[i] = new_contour
-    #                     merged.pop(j)
-    #                     changed = True
-    #                     break
-    #             if changed:
-    #                 break
+        # Preprocess ROI to connect characters
+        kernel = np.ones((2, 2), np.uint8)
+        roi_closed = cv2.morphologyEx(roi, cv2.MORPH_CLOSE, kernel)
 
-    #     if not merged:
-    #         return
+        # Contrast enhancement
+        roi_eq = cv2.equalizeHist(roi_sharp)
 
-    #     largest_contour = max(merged, key=lambda c: cv2.contourArea(c.reshape(-1, 1, 2)))
-    #     largest_contour = largest_contour.reshape(-1, 1, 2)
-    #     # ---------------------------------------------------
+        # Threshold (try both adaptive and binary)
+        roi_thresh = roi_eq 
+        # Uncomment below to try adaptive thresholding and comment above line
+        # roi_thresh = cv2.adaptiveThreshold(
+        #     roi_eq, 255,
+        #     cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        #     cv2.THRESH_BINARY,
+        #     11, 2
+        # )
+        # Optionally try: _, roi_thresh = cv2.threshold(roi_eq, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    #     slider_value = self.simplify_slider['slider'].value()  # 1-100
-    #     epsilon = (slider_value / 1000.0) * cv2.arcLength(largest_contour, True)  # 0.001–0.1 * arcLength
-    #     simplified = cv2.approxPolyDP(largest_contour, epsilon, True)
+        # Upscale more aggressively
+        roi_up = cv2.resize(roi_thresh, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
 
-    #     print(f"Original points: {len(largest_contour)}, Simplified: {len(simplified)}, Epsilon: {epsilon:.4f}, Kernel: {kernel_size}")
+        # Pad horizontally
+        pad = 20
+        roi_up = cv2.copyMakeBorder(roi_up, 0, 0, pad, pad, cv2.BORDER_CONSTANT, value=255)
 
-    #     self.decimated_contour = simplified
+        # --- Output the preprocessed ROI image ---
+        output_dir = "roi_debug_output"
+        os.makedirs(output_dir, exist_ok=True)
+        filename = f"roi_{int(time.time() * 1000)}.png"
+        output_path = os.path.join(output_dir, filename)
+        cv2.imwrite(output_path, roi_up)
+        print(f"Saved preprocessed ROI to {output_path}")
 
-    #     contour_img = self.original_image.copy()
-    #     cv2.drawContours(contour_img, [simplified], -1, (255, 0, 255), 2)
-    #     self.image = contour_img
-    #     self.update_canvas_image()          
+        return roi_up
 
-    # @staticmethod
-    # def segments_intersect(a1, a2, b1, b2):
-    #     """Return intersection point if segments (a1,a2) and (b1,b2) cross, else None."""
-    #     def ccw(A, B, C):
-    #         return (C[1]-A[1]) * (B[0]-A[0]) > (B[1]-A[1]) * (C[0]-A[0])
-    #     if (ccw(a1, b1, b2) != ccw(a2, b1, b2)) and (ccw(a1, a2, b1) != ccw(a1, a2, b2)):
-    #         # Compute intersection point
-    #         s = np.array(a1)
-    #         e = np.array(a2)
-    #         u = np.array(b1)
-    #         v = np.array(b2)
-    #         denom = (e[0]-s[0])*(v[1]-u[1]) - (e[1]-s[1])*(v[0]-u[0])
-    #         if denom == 0:
-    #             return None
-    #         t = ((s[0]-u[0])*(v[1]-u[1]) - (s[1]-u[1])*(v[0]-u[0])) / denom
-    #         intersection = s + t * (e-s)
-    #         return tuple(intersection.astype(int))
-    #     return None
+    def extract_text_along_decimated_lines(self):
+        if self.image is None or self.decimated_contour is None:
+            return None
 
-    # def contour_segments(contour):
-    #     pts = contour.reshape(-1, 2)
-    #     return [(tuple(pts[i]), tuple(pts[i+1])) for i in range(len(pts)-1)]
+        img = self.image.copy()
+        contour = self.decimated_contour
+        line_width = 100
+        results = []
 
+        # Use the largest contour for distance calculation
+        if hasattr(self, 'outer_contour') and self.outer_contour is not None:
+            main_contour = max(self.outer_contour, key=cv2.contourArea)
+        else:
+            main_contour = contour
+
+        max_distance_to_contour = 100  # pixels
+
+        for i in range(len(contour)):
+            pt1 = contour[i][0]
+            pt2 = contour[(i + 1) % len(contour)][0]
+
+            dx = pt2[0] - pt1[0]
+            dy = pt2[1] - pt1[1]
+            length = int(math.hypot(dx, dy))
+            if length < 10:
+                continue
+
+            # Midpoint of the segment
+            mx = int((pt1[0] + pt2[0]) / 2)
+            my = int((pt1[1] + pt2[1]) / 2)
+
+            # Distance from midpoint to contour
+            dist = cv2.pointPolygonTest(main_contour, (mx, my), True)
+            if abs(dist) > max_distance_to_contour:
+                continue  # Skip if farther than 100 pixels
+
+            angle = math.degrees(math.atan2(dy, dx))
+            cx = (pt1[0] + pt2[0]) / 2.0
+            cy = (pt1[1] + pt2[1]) / 2.0
+
+            try:
+                M = cv2.getRotationMatrix2D((cx, cy), angle, 1.0)
+                rotated = cv2.warpAffine(img, M, (img.shape[1], img.shape[0]), flags=cv2.INTER_CUBIC)
+
+                pts = np.array([[pt1], [pt2]], dtype=np.float32)
+                pts_rot = cv2.transform(pts, M)
+                x1r, y1r = pts_rot[0][0]
+                x2r, y2r = pts_rot[1][0]
+
+                x_min = int(min(x1r, x2r))
+                x_max = int(max(x1r, x2r))
+                y_center = int((y1r + y2r) / 2)
+                y_min = max(0, y_center - line_width // 2)
+                y_max = min(rotated.shape[0], y_center + line_width // 2)
+
+                if x_min >= x_max or y_min >= y_max:
+                    continue
+                roi = rotated[y_min:y_max, x_min:x_max]
+                if roi.size == 0 or roi.shape[0] < 5 or roi.shape[1] < 5:
+                    continue
+
+                # --- Preprocess ROI before OCR ---
+                roi_proc = self.preprocess_roi_for_ocr(roi)
+                #comment out above line and use below line to skip preprocessing
+                #roi_proc = roi
+                ocr_text = pytesseract.image_to_string(roi_proc, config="--psm 6").strip()
+
+                roi_inverted = cv2.rotate(roi, cv2.ROTATE_180)
+                #roi_inverted_proc = self.preprocess_roi_for_ocr(roi_inverted)
+                #comment out above line and use below line to skip preprocessing for inverted
+                roi_inverted_proc = roi_inverted
+                ocr_text_inverted = pytesseract.image_to_string(roi_inverted_proc, config="--psm 6").strip()
+                # ----------------------------------
+
+                all_texts = [ocr_text, ocr_text_inverted]
+                number_matches = []
+                for text in all_texts:
+                    number_matches += re.findall(r"\d{1,4}(?:\.\d{1,3})?\s*['\"]?", text)
+                distances = []
+                for match in number_matches:
+                    num_str = re.sub(r"[^\d.]", "", match)
+                    if '.' in num_str:
+                        try:
+                            distances.append(float(num_str))
+                        except ValueError:
+                            continue
+                distance_sum = sum(distances) if distances else 0.0
+                results.append({
+                    "index": i,
+                    "distance_sum_feet": distance_sum,
+                    "pt1": pt1,
+                    "pt2": pt2,
+                    "pixel_length": math.hypot(pt2[0] - pt1[0], pt2[1] - pt1[1])
+                })
+
+            except Exception as e:
+                print(f"Exception on line {i}: {e}")
+                continue
+
+        # Display results in the Qt table_text widget
+        self.table_text.clear()
+        if results:
+            for result in results:
+                self.table_text.append(f"Contour {result['index']}: Distance sum = {result['distance_sum_feet']:.2f}")
+        else:
+            self.table_text.append("No distances found along decimated contour lines.")
+
+        # Append scale factor to the table
+        if self.SCALE_FACTOR is not None:
+            self.table_text.append(f"\nScale Factor: {self.SCALE_FACTOR:.4f} meters/pixel")
+        else:
+            self.table_text.append("\nScale Factor: Not set")
+
+        return results if results else None
+
+    def Distance_find(self, ocr_results):
+        """
+        Sum all distances and update GUI.
+        Returns: total_distance, array of all distances
+        """
+        all_distances = []
+        for r in ocr_results:
+            all_distances.extend(r["distances"])
+        total_distance = sum(all_distances)
+        self.distance_label.setText(f"Measured Distance: {total_distance:.2f}")
+        self.distance_candidates = all_distances
+        return total_distance, all_distances
+    
+    def create_roi_overlay(self, roi_boxes, image_shape):
+        """
+        Draws ROI boxes as overlays for display.
+        roi_boxes: list of np.int32 corner arrays
+        image_shape: shape of the image to overlay on
+        Returns: overlay image
+        """
+        overlay = np.zeros(image_shape, dtype=np.uint8)
+        for box in roi_boxes:
+            cv2.polylines(overlay, [box], isClosed=True, color=(0, 255, 255), thickness=2)
+        return overlay
+
+    def sort_clockwise(self, points):
+        if not points:
+            return []
+
+        # Compute center of all points
+        cx = np.mean([pt[0] for _, pt in points])
+        cy = np.mean([pt[1] for _, pt in points])
+
+        def angle(p):
+            return np.arctan2(p[1] - cy, p[0] - cx)
+
+        return sorted(points, key=lambda x: angle(x[1]))
+  
+    def enable_brown_line_mode(self):
+        self.brown_line_mode = True
+        self.brown_line_points = []
+        self.statusBar().showMessage("Brown line mode: Click two points to add a brown line (snaps to nearest contour).")
+        self.canvas.left_click.disconnect()
+        self.canvas.left_click.connect(self.brown_line_click)
+        self.canvas.mouse_move.connect(self.brown_line_mouse_move)
+
+    def brown_line_click(self, x, y):
+        img_x, img_y = self.canvas_to_image_coords(x, y)
+        snap_x, snap_y = self.snap_to_nearest_contour((img_x, img_y))
+        self.brown_line_points.append((snap_x, snap_y))
+        if len(self.brown_line_points) == 1:
+            # Draw blue snap indicator
+            self.draw_snap_indicator((snap_x, snap_y))
+        elif len(self.brown_line_points) == 2:
+            # Add the brown line
+            self.brown_lines.append(tuple(self.brown_line_points))
+            self.brown_line_mode = False
+            self.statusBar().showMessage("Brown line added.")
+            self.brown_line_points = []
+            self.update_canvas_image()
+            # Restore normal left click
+            self.set_default_left_click()
+            self.canvas.mouse_move.disconnect(self.brown_line_mouse_move)
+
+    def brown_line_mouse_move(self, x, y):
+        if not self.brown_line_mode or len(self.brown_line_points) >= 2:
+            return
+        img_x, img_y = self.canvas_to_image_coords(x, y)
+        snap_x, snap_y = self.snap_to_nearest_contour((img_x, img_y))
+        self.draw_snap_indicator((snap_x, snap_y))
+
+    def snap_to_nearest_contour(self, pt):
+        # Snap to nearest point on any contour (decimated_contour)
+        if self.decimated_contour is None:
+            return pt
+        contour = self.decimated_contour.reshape(-1, 2)
+        dists = np.linalg.norm(contour - np.array(pt), axis=1)
+        idx = np.argmin(dists)
+        return tuple(contour[idx])
+
+    def draw_snap_indicator(self, pt):
+        # Draw a blue circle at pt on the canvas, with larger radius and thinner outline
+        self.update_canvas_image()  # Redraw base image
+        pixmap = self.canvas.pixmap().copy()
+        from PyQt5.QtGui import QPainter, QPen
+        from PyQt5.QtCore import QPoint
+        qp = QPainter(pixmap)
+        pen = QPen(QColor("blue"))
+        pen.setWidth(4)  # Thinner outline
+        qp.setPen(pen)
+        canvas_x, canvas_y = self.image_to_canvas_coords(pt[0], pt[1])
+        qp.drawEllipse(QPoint(canvas_x, canvas_y), 12, 12)  # Larger radius
+        qp.end()
+        self.canvas.setPixmap(pixmap)
+            # Optionally highlight the nearest segment
+        if self.decimated_contour is not None:
+            contour = self.decimated_contour.reshape(-1, 2)
+            dists = np.linalg.norm(contour - np.array(pt), axis=1)
+            idx = np.argmin(dists)
+            pt1 = contour[idx]
+            pt2 = contour[(idx + 1) % len(contour)]
+            pen_line = QPen(QColor("blue"))
+            pen_line.setWidth(2)
+            qp.setPen(pen_line)
+            x1, y1 = self.image_to_canvas_coords(pt1[0], pt1[1])
+            x2, y2 = self.image_to_canvas_coords(pt2[0], pt2[1])
+            qp.drawLine(x1, y1, x2, y2)
+
+    def image_to_canvas_coords(self, img_x, img_y):
+        # Inverse of canvas_to_image_coords
+        canvas_w, canvas_h = self.canvas.width(), self.canvas.height()
+        img_h, img_w = self.original_image.shape[:2]
+        scale = self.zoom_level
+        new_w = int(img_w * scale)
+        new_h = int(img_h * scale)
+        img_x0 = (canvas_w - new_w) // 2 + self.pan_x
+        img_y0 = (canvas_h - new_h) // 2 + self.pan_y
+        canvas_x = int(img_x * scale + img_x0)
+        canvas_y = int(img_y * scale + img_y0)
+        return canvas_x, canvas_y
+
+    def robust_scale_factor(self, pixel_lengths, real_distances_meters):
+        """
+        Robustly calculate scale factor (meters per pixel) using least squares and outlier rejection.
+        Returns: scale_factor, pixel_scale, inlier_mask
+        """
+        import numpy as np
+        pixel_lengths = np.array(pixel_lengths)
+        real_distances_meters = np.array(real_distances_meters)
+        if len(pixel_lengths) < 2 or len(real_distances_meters) < 2:
+            return None, None, None
+
+        # Linear fit: real_distance = scale_factor * pixel_length
+        A = np.vstack([pixel_lengths, np.ones(len(pixel_lengths))]).T
+        result = np.linalg.lstsq(A, real_distances_meters, rcond=None)
+        scale_factor, intercept = result[0]
+
+        # Calculate residuals
+        predicted = scale_factor * pixel_lengths + intercept
+        residuals = real_distances_meters - predicted
+        std_res = np.std(residuals)
+
+        # Identify inliers (within 2 standard deviations)
+        inlier_mask = np.abs(residuals) < 2 * std_res
+
+        # Refit using only inliers
+        if np.sum(inlier_mask) >= 2:
+            A_in = np.vstack([pixel_lengths[inlier_mask], np.ones(np.sum(inlier_mask))]).T
+            result_in = np.linalg.lstsq(A_in, real_distances_meters[inlier_mask], rcond=None)
+            scale_factor, intercept = result_in[0]
+            pixel_scale = 1.0 / scale_factor if scale_factor != 0 else None
+        else:
+            pixel_scale = None
+
+        return scale_factor, pixel_scale, inlier_mask
+
+    def on_aggressiveness_slider_changed(self):
+        # Restart the timer every time the slider value changes
+        self.aggressiveness_timer.start(200)
+
+    def on_contrast_slider_changed(self):
+        self.contrast_timer.start(200)
+
+    def on_pixel_slider_changed(self):
+        self.kernel_timer.start(200)
+
+    def on_simplify_slider_changed(self):
+        self.simplify_timer.start(200)
+
+    def find_best_contrast_for_ocr(self, roi=None, contrast_range=None):
+        """
+        Try different contrast settings and pick the one that gives the best OCR result.
+        roi: region of interest (numpy array). If None, use the whole original image.
+        contrast_range: list or range of contrast values to try (default: 60 to 180).
+        Returns: best_contrast, best_text, best_score
+        """
+        if roi is None:
+            roi = self.original_image
+        if contrast_range is None:
+            contrast_range = range(60, 181, 10)  # Try values from 60 to 180
+
+        best_score = -1
+        best_contrast = None
+        best_text = ""
+        for contrast in contrast_range:
+            alpha = contrast / 100.0
+            enhanced = cv2.convertScaleAbs(roi, alpha=alpha, beta=0)
+            # Preprocess for OCR if needed
+            gray = cv2.cvtColor(enhanced, cv2.COLOR_BGR2GRAY) if len(enhanced.shape) == 3 else enhanced
+            text = pytesseract.image_to_string(gray, config="--psm 6")
+            # Score: count number of digits found (or use another metric)
+            score = len(re.findall(r"\d", text))
+            if score > best_score:
+                best_score = score
+                best_contrast = contrast
+                best_text = text
+        return best_contrast, best_text, best_score
+
+    def auto_contrast_for_ocr(self):
+        best_contrast, best_text, best_score = self.find_best_contrast_for_ocr()
+        if best_contrast is not None:
+            self.contrast_slider['slider'].setValue(best_contrast)
+            self.statusBar().showMessage(f"Best contrast for OCR: {best_contrast} (score: {best_score})")
+            print("Best OCR text sample:", best_text)
+        else:
+            self.statusBar().showMessage("Auto contrast failed to find a better setting.")
+
+    def enable_auto_contrast_roi_mode(self):
+        self.statusBar().showMessage("Click near a contour segment to select ROI for auto contrast.")
+        try:
+            self.canvas.left_click.disconnect(self.add_seed_point)
+        except Exception:
+            pass
+        self.canvas.left_click.connect(self.auto_contrast_roi_pick)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if getattr(self, 'roi_selecting', False) and hasattr(self, 'roi_start') and hasattr(self, 'roi_end'):
+            painter = QPainter(self)
+            pen = QPen(QColor(255, 255, 0, 128))  # Semi-transparent yellow
+            pen.setWidth(2)
+            painter.setPen(pen)
+            x1, y1 = self.roi_start
+            x2, y2 = self.roi_end
+            painter.drawRect(min(x1, x2), min(y1, y2), abs(x2 - x1), abs(y2 - y1))
+            painter.end()
+
+    def auto_contrast_roi_pick(self, x, y):
+        img_x, img_y = self.canvas_to_image_coords(x, y)
+        if self.decimated_contour is None:
+            self.statusBar().showMessage("No contour available.")
+            return
+
+        contour = self.decimated_contour.reshape(-1, 2)
+        # Find nearest segment
+        min_dist = float('inf')
+        nearest_idx = 0
+        for i in range(len(contour)):
+            pt1 = contour[i]
+            pt2 = contour[(i + 1) % len(contour)]
+            v = np.array(pt2) - np.array(pt1)
+            w = np.array([img_x, img_y]) - np.array(pt1)
+            if np.dot(v, v) == 0:
+                proj = pt1
+            else:
+                t = np.clip(np.dot(w, v) / np.dot(v, v), 0, 1)
+                proj = pt1 + t * v
+            dist = np.linalg.norm(np.array([img_x, img_y]) - proj)
+            if dist < min_dist:
+                min_dist = dist
+                nearest_idx = i
+
+        pt1 = contour[nearest_idx]
+        pt2 = contour[(nearest_idx + 1) % len(contour)]
+        seg_vec = np.array(pt2) - np.array(pt1)
+        seg_len = np.linalg.norm(seg_vec)
+        if seg_len < 1:
+            self.statusBar().showMessage("Contour segment too short.")
+            return
+        seg_dir = seg_vec / seg_len
+        perp_dir = np.array([-seg_dir[1], seg_dir[0]])
+        center = (np.array(pt1) + np.array(pt2)) / 2
+        half_width = 50
+        p1 = center - seg_vec / 2 + perp_dir * half_width
+        p2 = center + seg_vec / 2 + perp_dir * half_width
+        p3 = center + seg_vec / 2 - perp_dir * half_width
+        p4 = center - seg_vec / 2 - perp_dir * half_width
+        roi_corners = np.array([p1, p2, p3, p4], dtype=np.float32)
+        dst_rect = np.array([
+            [0, 0],
+            [int(seg_len), 0],
+            [int(seg_len), 100],
+            [0, 100]
+        ], dtype=np.float32)
+        M = cv2.getPerspectiveTransform(roi_corners, dst_rect)
+        roi = cv2.warpPerspective(self.original_image, M, (int(seg_len), 100))
+
+        best_contrast, best_text, best_score = self.find_best_contrast_for_ocr(roi)
+        if best_contrast is not None:
+            self.contrast_slider['slider'].setValue(best_contrast)
+            self.statusBar().showMessage(f"Best contrast for OCR (ROI): {best_contrast} (score: {best_score})")
+            print("Best OCR text sample (ROI):", best_text)
+        else:
+            self.statusBar().showMessage("Auto contrast failed to find a better setting for ROI.")
+
+        # Draw ROI for feedback
+        overlay = self.image.copy() if self.image is not None else self.original_image.copy()
+        roi_poly = roi_corners.astype(np.int32).reshape((-1, 1, 2))
+        cv2.polylines(overlay, [roi_poly], isClosed=True, color=(0, 255, 255), thickness=2)
+        self.image = overlay
+        self.update_canvas_image()
+
+        # Restore normal left click
+        self.set_default_left_click()
+    
+    def on_extract_distances_clicked(self):
+        self.last_contour_distances = self.extract_text_along_decimated_lines()
+    
+    def set_default_left_click(self):
+        try:
+            self.canvas.left_click.disconnect(self.auto_contrast_roi_pick)
+        except Exception:
+            pass
+        try:
+            self.canvas.left_click.disconnect(self.brown_line_click)
+        except Exception:
+            pass
+        try:
+            self.canvas.left_click.disconnect(self.add_seed_point)
+        except Exception:
+            pass
+        self.canvas.left_click.connect(self.add_seed_point)
+
+    def on_brightness_slider_changed(self):
+        self.update_canvas_image()
+    
+    def reset_all_sliders(self):
+        # Reset all sliders to their default values
+        self.aggressiveness_slider['slider'].setValue(25)
+        self.pixel_slider['slider'].setValue(2)
+        self.contrast_slider['slider'].setValue(100)
+        # self.kernel_slider['slider'].setValue(5)
+        # self.lambda_slider['slider'].setValue(0)
+        self.simplify_slider['slider'].setValue(5)
+        self.brightness_slider['slider'].setValue(0)
+
+        # Also update the displayed values
+        self.aggressiveness_slider['value_label'].setText("25")
+        self.pixel_slider['value_label'].setText("2")
+        self.contrast_slider['value_label'].setText("100")
+        # self.kernel_slider['value_label'].setText("5")
+        # self.lambda_slider['value_label'].setText("0")
+        self.simplify_slider['value_label'].setText("5")
+        self.brightness_slider['value_label'].setText("0")
+
+                # Reset other relevant states if necessary
+        self.mask = None
+        self.seed_points = []
+        self.image = self.original_image.copy() if self.original_image is not None else None
+
+        self.update_canvas_image()
+
+    @staticmethod
+    def apply_contrast_brightness_preserve_white(img, alpha, beta):
+        img = img.astype(np.float32)
+        # Save mask of white pixels
+        white_mask = np.all(img == 255, axis=2) if img.ndim == 3 else (img == 255)
+        # Apply contrast and brightness
+        img = img * alpha + beta
+        # Restore white pixels
+        if img.ndim == 3:
+            img[white_mask] = 255
+        else:
+            img[white_mask] = 255
+        # Clip to [0, 255] and convert back to uint8
+        img = np.clip(img, 0, 255).astype(np.uint8)
+        return img
+   
     def create_simplified_contour_4(self):
         if self.mask is None or np.count_nonzero(self.mask) == 0:
             return
@@ -1116,34 +1642,60 @@ class FloodFillApp(QMainWindow):
         if not contours_offset:
             return
         outer_offset_contour = max(contours_offset, key=cv2.contourArea)
-
-        # 2. Create between_image: mask inside by inner mask, outside by outer mask
-        between_image = self.original_image.copy()
-        mask_inner = np.zeros_like(mask_orig)
-        cv2.drawContours(mask_inner, [outer_contour], -1, 255, thickness=cv2.FILLED)
-        between_image[mask_inner > 0] = 255
-        mask_outer = np.zeros_like(mask_orig)
-        cv2.drawContours(mask_outer, [outer_offset_contour], -1, 255, thickness=cv2.FILLED)
-        mask_outside = cv2.bitwise_not(mask_outer)
-        between_image[mask_outside > 0] = 255
-
-        # 3. Invert between_image
-        between_image_inv = cv2.bitwise_not(cv2.cvtColor(between_image, cv2.COLOR_BGR2GRAY))
-
-        # 4. Skeletonize
-        skeleton = skeletonize(between_image_inv > 0)
-        skeleton_uint8 = (skeleton * 255).astype(np.uint8)
-        self.simplified4_skeleton_img = skeleton_uint8
-
-        # 5. Find skeleton contours and simplify with Douglas-Peucker
-        min_length = int(self.pixel_slider['slider'].value() * 2)
-        skeleton_contours, _ = cv2.findContours(self.simplified4_skeleton_img, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
-        simplified_contours = []
-        base_epsilon_factor = self.simplify_slider['slider'].value() / 1000.0
         arc_len_outer = cv2.arcLength(outer_contour, True)
         num_points_outer = len(outer_contour)
         complexity = arc_len_outer / (num_points_outer + 1e-5)
-        epsilon_factor = base_epsilon_factor / (complexity + 1e-5)
+
+        # 2. Create between_image: mask inside by inner mask, outside by outer mask
+        between_image = self.original_image.copy()
+        mask_inner = np.zeros_like(mask_orig)
+        cv2.drawContours(mask_inner, [outer_contour], -1, 255, thickness=cv2.FILLED)
+        between_image[mask_inner > 0] = 255
+        mask_outer = np.zeros_like(mask_orig)
+        cv2.drawContours(mask_outer, [outer_offset_contour], -1, 255, thickness=cv2.FILLED)
+        mask_outside = cv2.bitwise_not(mask_outer)
+        between_image[mask_outside > 0] = 255
+
+        # 3. Invert between_image
+        between_image_inv = cv2.bitwise_not(cv2.cvtColor(between_image, cv2.COLOR_BGR2GRAY))
+
+        # Upscale
+        upscale_factor = 1
+        highres_mask = cv2.resize(
+            between_image_inv,
+            (between_image_inv.shape[1] * upscale_factor, between_image_inv.shape[0] * upscale_factor),
+            interpolation=cv2.INTER_CUBIC
+        )
+
+        # Thicken lines
+        dilation_kernel_size = max(2, upscale_factor)
+        kernel = np.ones((dilation_kernel_size, dilation_kernel_size), np.uint8)
+        thick_highres_mask = cv2.dilate(highres_mask, kernel, iterations=1)
+
+        # Fill small gaps
+        closed_highres_mask = cv2.morphologyEx(thick_highres_mask, cv2.MORPH_CLOSE, kernel)
+
+        # Remove small noise
+        clean_highres_mask = cv2.medianBlur(closed_highres_mask, 3)
+
+        # Skeletonize
+        pre_skel_mask = cv2.GaussianBlur(clean_highres_mask, (3, 3), 0)
+        skeleton_highres = skeletonize(pre_skel_mask > 0)
+        skeleton_highres_uint8 = (skeleton_highres * 255).astype(np.uint8)
+
+        # Downscale skeleton back to original size
+        skeleton_uint8 = cv2.resize(
+            skeleton_highres_uint8,
+            (between_image_inv.shape[1], between_image_inv.shape[0]),
+            interpolation=cv2.INTER_NEAREST
+        )
+        self.simplified4_skeleton_img = skeleton_uint8
+
+        # 5. Find skeleton contours and simplify with Douglas-Peucker
+        min_length = int(self.pixel_slider['slider'].value() * 2)
+        skeleton_contours, _ = cv2.findContours(self.simplified4_skeleton_img, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+        simplified_contours = []
+        epsilon_factor = self.simplify_slider['slider'].value() / 100.0
 
         for cnt in skeleton_contours:
             if len(cnt) < min_length:
@@ -1154,2685 +1706,59 @@ class FloodFillApp(QMainWindow):
             if len(simplified) >= 2:
                 simplified_contours.append(simplified)
 
-        # --- Remove shorter crossing contours and merge at intersection ---
-        def contour_segments(contour):
-            pts = contour.reshape(-1, 2)
-            return [(tuple(pts[i]), tuple(pts[i+1])) for i in range(len(pts)-1)]
+        N = 5
+        outer_pts = outer_contour.reshape(-1, 2)
+        contour_scores = []
+        for c in simplified_contours:
+            pts = c.reshape(-1, 2)
+            dists = [np.min(np.linalg.norm(outer_pts - pt, axis=1)) for pt in pts]
+            mean_dist = np.mean(dists)
+            length = cv2.arcLength(c, False)
+            score = length / (mean_dist + 1e-5)
+            contour_scores.append(score)
+        sorted_indices = np.argsort(contour_scores)[::-1]
+        N = 5
+        self.simplified4_prominent_contours = [simplified_contours[i] for i in sorted_indices[:N]]
 
-        def segments_intersect(a1, a2, b1, b2):
-            def ccw(A, B, C):
-                return (C[1]-A[1]) * (B[0]-A[0]) > (B[1]-A[1]) * (C[0]-A[0])
-            if (ccw(a1, b1, b2) != ccw(a2, b1, b2)) and (ccw(a1, a2, b1) != ccw(a1, a2, b2)):
-                s = np.array(a1)
-                e = np.array(a2)
-                u = np.array(b1)
-                v = np.array(b2)
-                denom = (e[0]-s[0])*(v[1]-u[1]) - (e[1]-s[1])*(v[0]-u[0])
-                if denom == 0:
-                    return None
-                t = ((s[0]-u[0])*(v[1]-u[1]) - (s[1]-u[1])*(v[0]-u[0])) / denom
-                intersection = s + t * (e-s)
-                return tuple(intersection.astype(int))
-            return None
-
-        to_remove = set()
-        intersections = []
-        for i, j in itertools.combinations(range(len(simplified_contours)), 2):
-            c1, c2 = simplified_contours[i], simplified_contours[j]
-            segs1 = contour_segments(c1)
-            segs2 = contour_segments(c2)
-            found = False
-            for s1 in segs1:
-                for s2 in segs2:
-                    pt = segments_intersect(s1[0], s1[1], s2[0], s2[1])
-                    if pt is not None:
-                        len1 = cv2.arcLength(c1, False)
-                        len2 = cv2.arcLength(c2, False)
-                        if len1 < len2:
-                            to_remove.add(i)
-                        else:
-                            to_remove.add(j)
-                        intersections.append(pt)
-                        found = True
-                        break
-                if found:
-                    break
-
-        filtered = [c for idx, c in enumerate(simplified_contours) if idx not in to_remove]
-
-        # Merge all remaining points and intersection points
-        all_pts = []
-        for c in filtered:
-            all_pts.extend([tuple(pt[0]) for pt in c])
-        all_pts.extend(intersections)
-
-        # Remove duplicates and order points clockwise
-        all_pts = list(dict.fromkeys(all_pts))
-        if len(all_pts) > 2:
-            center = np.mean(all_pts, axis=0)
-            all_pts.sort(key=lambda p: np.arctan2(p[1] - center[1], p[0] - center[0]))
-            closed_contour = np.array(all_pts, dtype=np.int32).reshape(-1, 1, 2)
-        else:
-            closed_contour = np.array(all_pts, dtype=np.int32).reshape(-1, 1, 2)
-
-        self.simplified4_prominent_contours = [closed_contour]
         self.simplified4_fitted_lines = []
         self.simplified4_fitted_curves = []
+        self.fit_best_lines_to_skeleton()
         self.update_canvas_image()
-    
-    def create_simplified_contour(self):
+        self.export_display_image("DisplayOuterContour_v5.png")
+
+    def create_simplified_contour_5(self):
         if self.mask is None or np.count_nonzero(self.mask) == 0:
             return
 
-        # Apply morphological closing/opening with kernel size from slider
-        kernel_size = self.pixel_slider['slider'].value()
-        if kernel_size > 1:
-            kernel = np.ones((kernel_size, kernel_size), np.uint8)
-            mask_for_contours = cv2.morphologyEx(self.mask, cv2.MORPH_CLOSE, kernel)
-        else:
-            mask_for_contours = self.mask.copy()
-
-        if mask_for_contours.max() > 1:
-            mask_for_contours = (mask_for_contours > 0).astype(np.uint8) * 255
-        contours, _ = cv2.findContours(mask_for_contours, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
-        if not contours:
-            return
-
-        largest_contour = max(contours, key=cv2.contourArea)
-        slider_value = 5 # self.simplify_slider['slider'].value()  # 1-100
-        epsilon = (slider_value / 1000.0) * cv2.arcLength(largest_contour, True)  # 0.001–0.1 * arcLength
-        simplified = cv2.approxPolyDP(largest_contour, epsilon, True)
-
-        print(f"Original points: {len(largest_contour)}, Simplified: {len(simplified)}, Epsilon: {epsilon:.4f}, Kernel: {kernel_size}")
-
-        self.decimated_contour = simplified
-
-        contour_img = self.original_image.copy()
-        cv2.drawContours(contour_img, [simplified], -1, (255, 0, 255), 2)
-        self.image = contour_img
-        self.update_canvas_image()        
-
-    def canvas_to_image_coords(self, x, y):
-        """Convert canvas (widget) coordinates to image coordinates, considering pan and zoom."""
-        canvas_w, canvas_h = self.canvas.width(), self.canvas.height()
-        img_h, img_w = self.original_image.shape[:2]
-        scale = self.zoom_level
-        #do not modify this line - intentional logic
-        new_w = int(img_w * scale)
-        new_h = int(img_h * scale)
-        # Do not modify this line — intentional logic
-        # Calculate top-left of image in canvas 
-        img_x0 = (canvas_w - new_w) // 2 + self.pan_x
-        img_y0 = (canvas_h - new_h) // 2 + self.pan_y
-        # Convert canvas to image coordinates
-        img_x = int((x - img_x0) / scale)
-        img_y = int((y - img_y0) / scale)
-        # Clamp to image bounds
-        img_x = np.clip(img_x, 0, img_w - 1)
-        img_y = np.clip(img_y, 0, img_h - 1)
-        return img_x, img_y
-
-    @staticmethod
-    def preprocess_roi_for_ocr(roi):
-        # Convert to grayscale
-        if len(roi.shape) == 3 and roi.shape[2] == 3:
-            roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        else:
-            roi_gray = roi
-
-        # Denoise
-        roi_denoised = cv2.fastNlMeansDenoising(roi_gray, None, h=30, templateWindowSize=7, searchWindowSize=21)
-
-        # Sharpen
-        kernel = np.array([[0, -1, 0], [-1, 5,-1], [0, -1, 0]])
-        roi_sharp = cv2.filter2D(roi_denoised, -1, kernel)
-
-        # Preprocess ROI to connect characters
-        kernel = np.ones((2, 2), np.uint8)
-        roi_closed = cv2.morphologyEx(roi, cv2.MORPH_CLOSE, kernel)
-
-        # Contrast enhancement
-        roi_eq = cv2.equalizeHist(roi_sharp)
-
-        # Threshold (try both adaptive and binary)
-        roi_thresh = roi_eq 
-        # Uncomment below to try adaptive thresholding and comment above line
-        # roi_thresh = cv2.adaptiveThreshold(
-        #     roi_eq, 255,
-        #     cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        #     cv2.THRESH_BINARY,
-        #     11, 2
-        # )
-        # Optionally try: _, roi_thresh = cv2.threshold(roi_eq, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-        # Upscale more aggressively
-        roi_up = cv2.resize(roi_thresh, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
-
-        # Pad horizontally
-        pad = 20
-        roi_up = cv2.copyMakeBorder(roi_up, 0, 0, pad, pad, cv2.BORDER_CONSTANT, value=255)
-
-        # --- Output the preprocessed ROI image ---
-        output_dir = "roi_debug_output"
-        os.makedirs(output_dir, exist_ok=True)
-        filename = f"roi_{int(time.time() * 1000)}.png"
-        output_path = os.path.join(output_dir, filename)
-        cv2.imwrite(output_path, roi_up)
-        print(f"Saved preprocessed ROI to {output_path}")
-
-        return roi_up
-
-    def extract_text_along_decimated_lines(self):
-        if self.image is None or self.decimated_contour is None:
-            return None
-
-        img = self.image.copy()
-        contour = self.decimated_contour
-        line_width = 100
-        results = []
-
-        # Use the largest contour for distance calculation
-        if hasattr(self, 'outer_contour') and self.outer_contour is not None:
-            main_contour = max(self.outer_contour, key=cv2.contourArea)
-        else:
-            main_contour = contour
-
-        max_distance_to_contour = 100  # pixels
-
-        for i in range(len(contour)):
-            pt1 = contour[i][0]
-            pt2 = contour[(i + 1) % len(contour)][0]
-
-            dx = pt2[0] - pt1[0]
-            dy = pt2[1] - pt1[1]
-            length = int(math.hypot(dx, dy))
-            if length < 10:
-                continue
-
-            # Midpoint of the segment
-            mx = int((pt1[0] + pt2[0]) / 2)
-            my = int((pt1[1] + pt2[1]) / 2)
-
-            # Distance from midpoint to contour
-            dist = cv2.pointPolygonTest(main_contour, (mx, my), True)
-            if abs(dist) > max_distance_to_contour:
-                continue  # Skip if farther than 100 pixels
-
-            angle = math.degrees(math.atan2(dy, dx))
-            cx = (pt1[0] + pt2[0]) / 2.0
-            cy = (pt1[1] + pt2[1]) / 2.0
-
-            try:
-                M = cv2.getRotationMatrix2D((cx, cy), angle, 1.0)
-                rotated = cv2.warpAffine(img, M, (img.shape[1], img.shape[0]), flags=cv2.INTER_CUBIC)
-
-                pts = np.array([[pt1], [pt2]], dtype=np.float32)
-                pts_rot = cv2.transform(pts, M)
-                x1r, y1r = pts_rot[0][0]
-                x2r, y2r = pts_rot[1][0]
-
-                x_min = int(min(x1r, x2r))
-                x_max = int(max(x1r, x2r))
-                y_center = int((y1r + y2r) / 2)
-                y_min = max(0, y_center - line_width // 2)
-                y_max = min(rotated.shape[0], y_center + line_width // 2)
-
-                if x_min >= x_max or y_min >= y_max:
-                    continue
-                roi = rotated[y_min:y_max, x_min:x_max]
-                if roi.size == 0 or roi.shape[0] < 5 or roi.shape[1] < 5:
-                    continue
-
-                # --- Preprocess ROI before OCR ---
-                roi_proc = self.preprocess_roi_for_ocr(roi)
-                #comment out above line and use below line to skip preprocessing
-                #roi_proc = roi
-                ocr_text = pytesseract.image_to_string(roi_proc, config="--psm 6").strip()
-
-                roi_inverted = cv2.rotate(roi, cv2.ROTATE_180)
-                #roi_inverted_proc = self.preprocess_roi_for_ocr(roi_inverted)
-                #comment out above line and use below line to skip preprocessing for inverted
-                roi_inverted_proc = roi_inverted
-                ocr_text_inverted = pytesseract.image_to_string(roi_inverted_proc, config="--psm 6").strip()
-                # ----------------------------------
-
-                all_texts = [ocr_text, ocr_text_inverted]
-                number_matches = []
-                for text in all_texts:
-                    number_matches += re.findall(r"\d{1,4}(?:\.\d{1,3})?\s*['\"]?", text)
-                distances = []
-                for match in number_matches:
-                    num_str = re.sub(r"[^\d.]", "", match)
-                    if '.' in num_str:
-                        try:
-                            distances.append(float(num_str))
-                        except ValueError:
-                            continue
-                distance_sum = sum(distances) if distances else 0.0
-                results.append({
-                    "index": i,
-                    "distance_sum_feet": distance_sum,
-                    "pt1": pt1,
-                    "pt2": pt2,
-                    "pixel_length": math.hypot(pt2[0] - pt1[0], pt2[1] - pt1[1])
-                })
-
-            except Exception as e:
-                print(f"Exception on line {i}: {e}")
-                continue
-
-        # Display results in the Qt table_text widget
-        self.table_text.clear()
-        if results:
-            for result in results:
-                self.table_text.append(f"Contour {result['index']}: Distance sum = {result['distance_sum_feet']:.2f}")
-        else:
-            self.table_text.append("No distances found along decimated contour lines.")
-
-        # Append scale factor to the table
-        if self.SCALE_FACTOR is not None:
-            self.table_text.append(f"\nScale Factor: {self.SCALE_FACTOR:.4f} meters/pixel")
-        else:
-            self.table_text.append("\nScale Factor: Not set")
-
-        return results if results else None
-
-    def Distance_find(self, ocr_results):
-        """
-        Sum all distances and update GUI.
-        Returns: total_distance, array of all distances
-        """
-        all_distances = []
-        for r in ocr_results:
-            all_distances.extend(r["distances"])
-        total_distance = sum(all_distances)
-        self.distance_label.setText(f"Measured Distance: {total_distance:.2f}")
-        self.distance_candidates = all_distances
-        return total_distance, all_distances
-    
-    def create_roi_overlay(self, roi_boxes, image_shape):
-        """
-        Draws ROI boxes as overlays for display.
-        roi_boxes: list of np.int32 corner arrays
-        image_shape: shape of the image to overlay on
-        Returns: overlay image
-        """
-        overlay = np.zeros(image_shape, dtype=np.uint8)
-        for box in roi_boxes:
-            cv2.polylines(overlay, [box], isClosed=True, color=(0, 255, 255), thickness=2)
-        return overlay
-
-    def sort_clockwise(self, points):
-        if not points:
-            return []
-
-        # Compute center of all points
-        cx = np.mean([pt[0] for _, pt in points])
-        cy = np.mean([pt[1] for _, pt in points])
-
-        def angle(p):
-            return np.arctan2(p[1] - cy, p[0] - cx)
-
-        return sorted(points, key=lambda x: angle(x[1]))
-  
-    def enable_brown_line_mode(self):
-        self.brown_line_mode = True
-        self.brown_line_points = []
-        self.statusBar().showMessage("Brown line mode: Click two points to add a brown line (snaps to nearest contour).")
-        self.canvas.left_click.disconnect()
-        self.canvas.left_click.connect(self.brown_line_click)
-        self.canvas.mouse_move.connect(self.brown_line_mouse_move)
-
-    def brown_line_click(self, x, y):
-        img_x, img_y = self.canvas_to_image_coords(x, y)
-        snap_x, snap_y = self.snap_to_nearest_contour((img_x, img_y))
-        self.brown_line_points.append((snap_x, snap_y))
-        if len(self.brown_line_points) == 1:
-            # Draw blue snap indicator
-            self.draw_snap_indicator((snap_x, snap_y))
-        elif len(self.brown_line_points) == 2:
-            # Add the brown line
-            self.brown_lines.append(tuple(self.brown_line_points))
-            self.brown_line_mode = False
-            self.statusBar().showMessage("Brown line added.")
-            self.brown_line_points = []
-            self.update_canvas_image()
-            # Restore normal left click
-            self.set_default_left_click()
-            self.canvas.mouse_move.disconnect(self.brown_line_mouse_move)
-
-    def brown_line_mouse_move(self, x, y):
-        if not self.brown_line_mode or len(self.brown_line_points) >= 2:
-            return
-        img_x, img_y = self.canvas_to_image_coords(x, y)
-        snap_x, snap_y = self.snap_to_nearest_contour((img_x, img_y))
-        self.draw_snap_indicator((snap_x, snap_y))
-
-    def snap_to_nearest_contour(self, pt):
-        # Snap to nearest point on any contour (decimated_contour)
-        if self.decimated_contour is None:
-            return pt
-        contour = self.decimated_contour.reshape(-1, 2)
-        dists = np.linalg.norm(contour - np.array(pt), axis=1)
-        idx = np.argmin(dists)
-        return tuple(contour[idx])
-
-    def draw_snap_indicator(self, pt):
-        # Draw a blue circle at pt on the canvas, with larger radius and thinner outline
-        self.update_canvas_image()  # Redraw base image
-        pixmap = self.canvas.pixmap().copy()
-        from PyQt5.QtGui import QPainter, QPen
-        from PyQt5.QtCore import QPoint
-        qp = QPainter(pixmap)
-        pen = QPen(QColor("blue"))
-        pen.setWidth(4)  # Thinner outline
-        qp.setPen(pen)
-        canvas_x, canvas_y = self.image_to_canvas_coords(pt[0], pt[1])
-        qp.drawEllipse(QPoint(canvas_x, canvas_y), 12, 12)  # Larger radius
-        qp.end()
-        self.canvas.setPixmap(pixmap)
-            # Optionally highlight the nearest segment
-        if self.decimated_contour is not None:
-            contour = self.decimated_contour.reshape(-1, 2)
-            dists = np.linalg.norm(contour - np.array(pt), axis=1)
-            idx = np.argmin(dists)
-            pt1 = contour[idx]
-            pt2 = contour[(idx + 1) % len(contour)]
-            pen_line = QPen(QColor("blue"))
-            pen_line.setWidth(2)
-            qp.setPen(pen_line)
-            x1, y1 = self.image_to_canvas_coords(pt1[0], pt1[1])
-            x2, y2 = self.image_to_canvas_coords(pt2[0], pt2[1])
-            qp.drawLine(x1, y1, x2, y2)
-
-    def image_to_canvas_coords(self, img_x, img_y):
-        # Inverse of canvas_to_image_coords
-        canvas_w, canvas_h = self.canvas.width(), self.canvas.height()
-        img_h, img_w = self.original_image.shape[:2]
-        scale = self.zoom_level
-        new_w = int(img_w * scale)
-        new_h = int(img_h * scale)
-        img_x0 = (canvas_w - new_w) // 2 + self.pan_x
-        img_y0 = (canvas_h - new_h) // 2 + self.pan_y
-        canvas_x = int(img_x * scale + img_x0)
-        canvas_y = int(img_y * scale + img_y0)
-        return canvas_x, canvas_y
-
-    def robust_scale_factor(self, pixel_lengths, real_distances_meters):
-        """
-        Robustly calculate scale factor (meters per pixel) using least squares and outlier rejection.
-        Returns: scale_factor, pixel_scale, inlier_mask
-        """
-        import numpy as np
-        pixel_lengths = np.array(pixel_lengths)
-        real_distances_meters = np.array(real_distances_meters)
-        if len(pixel_lengths) < 2 or len(real_distances_meters) < 2:
-            return None, None, None
-
-        # Linear fit: real_distance = scale_factor * pixel_length
-        A = np.vstack([pixel_lengths, np.ones(len(pixel_lengths))]).T
-        result = np.linalg.lstsq(A, real_distances_meters, rcond=None)
-        scale_factor, intercept = result[0]
-
-        # Calculate residuals
-        predicted = scale_factor * pixel_lengths + intercept
-        residuals = real_distances_meters - predicted
-        std_res = np.std(residuals)
-
-        # Identify inliers (within 2 standard deviations)
-        inlier_mask = np.abs(residuals) < 2 * std_res
-
-        # Refit using only inliers
-        if np.sum(inlier_mask) >= 2:
-            A_in = np.vstack([pixel_lengths[inlier_mask], np.ones(np.sum(inlier_mask))]).T
-            result_in = np.linalg.lstsq(A_in, real_distances_meters[inlier_mask], rcond=None)
-            scale_factor, intercept = result_in[0]
-            pixel_scale = 1.0 / scale_factor if scale_factor != 0 else None
-        else:
-            pixel_scale = None
-
-        return scale_factor, pixel_scale, inlier_mask
-
-    def on_aggressiveness_slider_changed(self):
-        # Restart the timer every time the slider value changes
-        self.aggressiveness_timer.start(200)
-
-    def on_contrast_slider_changed(self):
-        self.contrast_timer.start(200)
-
-    def on_pixel_slider_changed(self):
-        self.kernel_timer.start(200)
-
-    def on_simplify_slider_changed(self):
-        self.simplify_timer.start(200)
-
-    def find_best_contrast_for_ocr(self, roi=None, contrast_range=None):
-        """
-        Try different contrast settings and pick the one that gives the best OCR result.
-        roi: region of interest (numpy array). If None, use the whole original image.
-        contrast_range: list or range of contrast values to try (default: 60 to 180).
-        Returns: best_contrast, best_text, best_score
-        """
-        if roi is None:
-            roi = self.original_image
-        if contrast_range is None:
-            contrast_range = range(60, 181, 10)  # Try values from 60 to 180
-
-        best_score = -1
-        best_contrast = None
-        best_text = ""
-        for contrast in contrast_range:
-            alpha = contrast / 100.0
-            enhanced = cv2.convertScaleAbs(roi, alpha=alpha, beta=0)
-            # Preprocess for OCR if needed
-            gray = cv2.cvtColor(enhanced, cv2.COLOR_BGR2GRAY) if len(enhanced.shape) == 3 else enhanced
-            text = pytesseract.image_to_string(gray, config="--psm 6")
-            # Score: count number of digits found (or use another metric)
-            score = len(re.findall(r"\d", text))
-            if score > best_score:
-                best_score = score
-                best_contrast = contrast
-                best_text = text
-        return best_contrast, best_text, best_score
-
-    def auto_contrast_for_ocr(self):
-        best_contrast, best_text, best_score = self.find_best_contrast_for_ocr()
-        if best_contrast is not None:
-            self.contrast_slider['slider'].setValue(best_contrast)
-            self.statusBar().showMessage(f"Best contrast for OCR: {best_contrast} (score: {best_score})")
-            print("Best OCR text sample:", best_text)
-        else:
-            self.statusBar().showMessage("Auto contrast failed to find a better setting.")
-
-    def enable_auto_contrast_roi_mode(self):
-        self.statusBar().showMessage("Click near a contour segment to select ROI for auto contrast.")
-        try:
-            self.canvas.left_click.disconnect(self.add_seed_point)
-        except Exception:
-            pass
-        self.canvas.left_click.connect(self.auto_contrast_roi_pick)
-
-    def paintEvent(self, event):
-        super().paintEvent(event)
-        if getattr(self, 'roi_selecting', False) and hasattr(self, 'roi_start') and hasattr(self, 'roi_end'):
-            painter = QPainter(self)
-            pen = QPen(QColor(255, 255, 0, 128))  # Semi-transparent yellow
-            pen.setWidth(2)
-            painter.setPen(pen)
-            x1, y1 = self.roi_start
-            x2, y2 = self.roi_end
-            painter.drawRect(min(x1, x2), min(y1, y2), abs(x2 - x1), abs(y2 - y1))
-            painter.end()
-
-    def auto_contrast_roi_pick(self, x, y):
-        img_x, img_y = self.canvas_to_image_coords(x, y)
-        if self.decimated_contour is None:
-            self.statusBar().showMessage("No contour available.")
-            return
-
-        contour = self.decimated_contour.reshape(-1, 2)
-        # Find nearest segment
-        min_dist = float('inf')
-        nearest_idx = 0
-        for i in range(len(contour)):
-            pt1 = contour[i]
-            pt2 = contour[(i + 1) % len(contour)]
-            v = np.array(pt2) - np.array(pt1)
-            w = np.array([img_x, img_y]) - np.array(pt1)
-            if np.dot(v, v) == 0:
-                proj = pt1
-            else:
-                t = np.clip(np.dot(w, v) / np.dot(v, v), 0, 1)
-                proj = pt1 + t * v
-            dist = np.linalg.norm(np.array([img_x, img_y]) - proj)
-            if dist < min_dist:
-                min_dist = dist
-                nearest_idx = i
-
-        pt1 = contour[nearest_idx]
-        pt2 = contour[(nearest_idx + 1) % len(contour)]
-        seg_vec = np.array(pt2) - np.array(pt1)
-        seg_len = np.linalg.norm(seg_vec)
-        if seg_len < 1:
-            self.statusBar().showMessage("Contour segment too short.")
-            return
-        seg_dir = seg_vec / seg_len
-        perp_dir = np.array([-seg_dir[1], seg_dir[0]])
-        center = (np.array(pt1) + np.array(pt2)) / 2
-        half_width = 50
-        p1 = center - seg_vec / 2 + perp_dir * half_width
-        p2 = center + seg_vec / 2 + perp_dir * half_width
-        p3 = center + seg_vec / 2 - perp_dir * half_width
-        p4 = center - seg_vec / 2 - perp_dir * half_width
-        roi_corners = np.array([p1, p2, p3, p4], dtype=np.float32)
-        dst_rect = np.array([
-            [0, 0],
-            [int(seg_len), 0],
-            [int(seg_len), 100],
-            [0, 100]
-        ], dtype=np.float32)
-        M = cv2.getPerspectiveTransform(roi_corners, dst_rect)
-        roi = cv2.warpPerspective(self.original_image, M, (int(seg_len), 100))
-
-        best_contrast, best_text, best_score = self.find_best_contrast_for_ocr(roi)
-        if best_contrast is not None:
-            self.contrast_slider['slider'].setValue(best_contrast)
-            self.statusBar().showMessage(f"Best contrast for OCR (ROI): {best_contrast} (score: {best_score})")
-            print("Best OCR text sample (ROI):", best_text)
-        else:
-            self.statusBar().showMessage("Auto contrast failed to find a better setting for ROI.")
-
-        # Draw ROI for feedback
-        overlay = self.image.copy() if self.image is not None else self.original_image.copy()
-        roi_poly = roi_corners.astype(np.int32).reshape((-1, 1, 2))
-        cv2.polylines(overlay, [roi_poly], isClosed=True, color=(0, 255, 255), thickness=2)
-        self.image = overlay
-        self.update_canvas_image()
-
-        # Restore normal left click
-        self.set_default_left_click()
-    
-    def on_extract_distances_clicked(self):
-        self.last_contour_distances = self.extract_text_along_decimated_lines()
-    
-    def set_default_left_click(self):
-        try:
-            self.canvas.left_click.disconnect(self.auto_contrast_roi_pick)
-        except Exception:
-            pass
-        try:
-            self.canvas.left_click.disconnect(self.brown_line_click)
-        except Exception:
-            pass
-        try:
-            self.canvas.left_click.disconnect(self.add_seed_point)
-        except Exception:
-            pass
-        self.canvas.left_click.connect(self.add_seed_point)
-
-    def on_brightness_slider_changed(self):
-        self.update_canvas_image()
-    
-    def reset_all_sliders(self):
-        # Reset all sliders to their default values
-        self.aggressiveness_slider['slider'].setValue(25)
-        self.pixel_slider['slider'].setValue(2)
-        self.contrast_slider['slider'].setValue(100)
-        # self.kernel_slider['slider'].setValue(5)
-        # self.lambda_slider['slider'].setValue(0)
-        self.simplify_slider['slider'].setValue(5)
-        self.brightness_slider['slider'].setValue(0)
-
-        # Also update the displayed values
-        self.aggressiveness_slider['value_label'].setText("25")
-        self.pixel_slider['value_label'].setText("2")
-        self.contrast_slider['value_label'].setText("100")
-        # self.kernel_slider['value_label'].setText("5")
-        # self.lambda_slider['value_label'].setText("0")
-        self.simplify_slider['value_label'].setText("5")
-        self.brightness_slider['value_label'].setText("0")
-
-                # Reset other relevant states if necessary
-        self.mask = None
-        self.seed_points = []
-        self.image = self.original_image.copy() if self.original_image is not None else None
-
-        self.update_canvas_image()
-
-    @staticmethod
-    def apply_contrast_brightness_preserve_white(img, alpha, beta):
-        img = img.astype(np.float32)
-        # Save mask of white pixels
-        white_mask = np.all(img == 255, axis=2) if img.ndim == 3 else (img == 255)
-        # Apply contrast and brightness
-        img = img * alpha + beta
-        # Restore white pixels
-        if img.ndim == 3:
-            img[white_mask] = 255
-        else:
-            img[white_mask] = 255
-        # Clip to [0, 255] and convert back to uint8
-        img = np.clip(img, 0, 255).astype(np.uint8)
-        return img
-   
-    def create_simplified_contour_4(self):
-        if self.mask is None or np.count_nonzero(self.mask) == 0:
-            return
-
-        # 1. Offset outer contour by 4*pixel_slider
-        mask_orig = (self.mask > 0).astype(np.uint8) * 255
-        contours, _ = cv2.findContours(mask_orig, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        mask_for_contours = (self.mask > 0).astype(np.uint8) * 255
+        contours, _ = cv2.findContours(mask_for_contours, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
             return
         outer_contour = max(contours, key=cv2.contourArea)
-        offset_amt = max(1, int(self.pixel_slider['slider'].value() * 4))
+        abutting_contours = [c for c in contours if not np.array_equal(c, outer_contour)]
+
+        slider_value = self.simplify_slider['slider'].value()
+        # Offset the outer contour outward by (pixel_slider + 1) pixels
+        offset_amt = int(self.pixel_slider['slider'].value()) + 3
+        mask_shape = mask_for_contours.shape
+        blank = np.zeros(mask_shape, dtype=np.uint8)
+        cv2.drawContours(blank, [outer_contour], -1, 255, thickness=cv2.FILLED)
         kernel = np.ones((offset_amt, offset_amt), np.uint8)
-        mask_outer_offset = cv2.dilate(mask_orig, kernel, iterations=1)
-        contours_offset, _ = cv2.findContours(mask_outer_offset, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours_offset:
+        dilated = cv2.dilate(blank, kernel, iterations=1)
+        offset_contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not offset_contours:
             return
-        outer_offset_contour = max(contours_offset, key=cv2.contourArea)
-        # for complexity metric
-        arc_len_outer = cv2.arcLength(outer_contour, True)
-        num_points_outer = len(outer_contour)
-        complexity = arc_len_outer / (num_points_outer + 1e-5)  # Avoid division by zero
+        offset_contour = max(offset_contours, key=cv2.contourArea)
 
-        # 2. Create between_image: mask inside by inner mask, outside by outer mask
-        between_image = self.original_image.copy()
-        mask_inner = np.zeros_like(mask_orig)
-        cv2.drawContours(mask_inner, [outer_contour], -1, 255, thickness=cv2.FILLED)
-        between_image[mask_inner > 0] = 255
-        mask_outer = np.zeros_like(mask_orig)
-        cv2.drawContours(mask_outer, [outer_offset_contour], -1, 255, thickness=cv2.FILLED)
-        mask_outside = cv2.bitwise_not(mask_outer)
-        between_image[mask_outside > 0] = 255
-
-        # 3. Invert between_image
-        between_image_inv = cv2.bitwise_not(cv2.cvtColor(between_image, cv2.COLOR_BGR2GRAY))
-
-        # 4. Skeletonize
-        skeleton = skeletonize(between_image_inv > 0)
-        skeleton_uint8 = (skeleton * 255).astype(np.uint8)
-        self.simplified4_skeleton_img = skeleton_uint8
-
-        # 5. Find skeleton contours and simplify with Douglas-Peucker
-        min_length = int(self.pixel_slider['slider'].value() * 2)
-        skeleton_contours, _ = cv2.findContours(self.simplified4_skeleton_img, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
-        simplified_contours = []
-        epsilon_factor = self.simplify_slider['slider'].value() / 100.0  # Use simplify slider
-
-        for cnt in skeleton_contours:
-            if len(cnt) < min_length:
-                continue
-            arc_len = cv2.arcLength(cnt, False)
-            epsilon = epsilon_factor * arc_len
-            simplified = cv2.approxPolyDP(cnt, epsilon, False)
-            if len(simplified) >= 2:
-                simplified_contours.append(simplified)
-
-        # Find the most prominent (longest) contour(s) parallel to mask_outer
-        # Here, we select the largest by arc length
-        N = 5
-        outer_pts = outer_contour.reshape(-1, 2)
-        contour_scores = []
-        for c in simplified_contours:
-            pts = c.reshape(-1, 2)
-            # Mean distance to outer contour
-            dists = [np.min(np.linalg.norm(outer_pts - pt, axis=1)) for pt in pts]
-            mean_dist = np.mean(dists)
-            length = cv2.arcLength(c, False)
-            # Score: prefer long and close to outer contour
-            score = length / (mean_dist + 1e-5)
-            contour_scores.append(score)
-        sorted_indices = np.argsort(contour_scores)[::-1]
-        N = 5  # or any number you want
-        self.simplified4_prominent_contours = [simplified_contours[i] for i in sorted_indices[:N]]
-
-        self.simplified4_fitted_lines = []  # Optionally clear lines
-        self.simplified4_fitted_curves = []
-        self.update_canvas_image()
-    
-    def create_simplified_contour(self):
-        if self.mask is None or np.count_nonzero(self.mask) == 0:
-            return
-
-        # Apply morphological closing/opening with kernel size from slider
-        kernel_size = self.pixel_slider['slider'].value()
-        if kernel_size > 1:
-            kernel = np.ones((kernel_size, kernel_size), np.uint8)
-            mask_for_contours = cv2.morphologyEx(self.mask, cv2.MORPH_CLOSE, kernel)
-        else:
-            mask_for_contours = self.mask.copy()
-
-        if mask_for_contours.max() > 1:
-            mask_for_contours = (mask_for_contours > 0).astype(np.uint8) * 255
-        contours, _ = cv2.findContours(mask_for_contours, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
-        if not contours:
-            return
-
-        largest_contour = max(contours, key=cv2.contourArea)
-        slider_value = 5 # self.simplify_slider['slider'].value()  # 1-100
-        epsilon = (slider_value / 1000.0) * cv2.arcLength(largest_contour, True)  # 0.001–0.1 * arcLength
-        simplified = cv2.approxPolyDP(largest_contour, epsilon, True)
-
-        print(f"Original points: {len(largest_contour)}, Simplified: {len(simplified)}, Epsilon: {epsilon:.4f}, Kernel: {kernel_size}")
-
+        # --- Apply simplification to the offset contour ---
+        simplified = self.simplify_contour_midpoint_intersection(offset_contour, abutting_contours, slider_value)
         self.decimated_contour = simplified
 
-        contour_img = self.original_image.copy()
-        cv2.drawContours(contour_img, [simplified], -1, (255, 0, 255), 2)
-        self.image = contour_img
-        self.update_canvas_image()        
-
-    def canvas_to_image_coords(self, x, y):
-        """Convert canvas (widget) coordinates to image coordinates, considering pan and zoom."""
-        canvas_w, canvas_h = self.canvas.width(), self.canvas.height()
-        img_h, img_w = self.original_image.shape[:2]
-        scale = self.zoom_level
-        #do not modify this line - intentional logic
-        new_w = int(img_w * scale)
-        new_h = int(img_h * scale)
-        # Do not modify this line — intentional logic
-        # Calculate top-left of image in canvas 
-        img_x0 = (canvas_w - new_w) // 2 + self.pan_x
-        img_y0 = (canvas_h - new_h) // 2 + self.pan_y
-        # Convert canvas to image coordinates
-        img_x = int((x - img_x0) / scale)
-        img_y = int((y - img_y0) / scale)
-        # Clamp to image bounds
-        img_x = np.clip(img_x, 0, img_w - 1)
-        img_y = np.clip(img_y, 0, img_h - 1)
-        return img_x, img_y
-
-    @staticmethod
-    def preprocess_roi_for_ocr(roi):
-        # Convert to grayscale
-        if len(roi.shape) == 3 and roi.shape[2] == 3:
-            roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        else:
-            roi_gray = roi
-
-        # Denoise
-        roi_denoised = cv2.fastNlMeansDenoising(roi_gray, None, h=30, templateWindowSize=7, searchWindowSize=21)
-
-        # Sharpen
-        kernel = np.array([[0, -1, 0], [-1, 5,-1], [0, -1, 0]])
-        roi_sharp = cv2.filter2D(roi_denoised, -1, kernel)
-
-        # Preprocess ROI to connect characters
-        kernel = np.ones((2, 2), np.uint8)
-        roi_closed = cv2.morphologyEx(roi, cv2.MORPH_CLOSE, kernel)
-
-        # Contrast enhancement
-        roi_eq = cv2.equalizeHist(roi_sharp)
-
-        # Threshold (try both adaptive and binary)
-        roi_thresh = roi_eq 
-        # Uncomment below to try adaptive thresholding and comment above line
-        # roi_thresh = cv2.adaptiveThreshold(
-        #     roi_eq, 255,
-        #     cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        #     cv2.THRESH_BINARY,
-        #     11, 2
-        # )
-        # Optionally try: _, roi_thresh = cv2.threshold(roi_eq, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-        # Upscale more aggressively
-        roi_up = cv2.resize(roi_thresh, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
-
-        # Pad horizontally
-        pad = 20
-        roi_up = cv2.copyMakeBorder(roi_up, 0, 0, pad, pad, cv2.BORDER_CONSTANT, value=255)
-
-        # --- Output the preprocessed ROI image ---
-        output_dir = "roi_debug_output"
-        os.makedirs(output_dir, exist_ok=True)
-        filename = f"roi_{int(time.time() * 1000)}.png"
-        output_path = os.path.join(output_dir, filename)
-        cv2.imwrite(output_path, roi_up)
-        print(f"Saved preprocessed ROI to {output_path}")
-
-        return roi_up
-
-    def extract_text_along_decimated_lines(self):
-        if self.image is None or self.decimated_contour is None:
-            return None
-
-        img = self.image.copy()
-        contour = self.decimated_contour
-        line_width = 100
-        results = []
-
-        # Use the largest contour for distance calculation
-        if hasattr(self, 'outer_contour') and self.outer_contour is not None:
-            main_contour = max(self.outer_contour, key=cv2.contourArea)
-        else:
-            main_contour = contour
-
-        max_distance_to_contour = 100  # pixels
-
-        for i in range(len(contour)):
-            pt1 = contour[i][0]
-            pt2 = contour[(i + 1) % len(contour)][0]
-
-            dx = pt2[0] - pt1[0]
-            dy = pt2[1] - pt1[1]
-            length = int(math.hypot(dx, dy))
-            if length < 10:
-                continue
-
-            # Midpoint of the segment
-            mx = int((pt1[0] + pt2[0]) / 2)
-            my = int((pt1[1] + pt2[1]) / 2)
-
-            # Distance from midpoint to contour
-            dist = cv2.pointPolygonTest(main_contour, (mx, my), True)
-            if abs(dist) > max_distance_to_contour:
-                continue  # Skip if farther than 100 pixels
-
-            angle = math.degrees(math.atan2(dy, dx))
-            cx = (pt1[0] + pt2[0]) / 2.0
-            cy = (pt1[1] + pt2[1]) / 2.0
-
-            try:
-                M = cv2.getRotationMatrix2D((cx, cy), angle, 1.0)
-                rotated = cv2.warpAffine(img, M, (img.shape[1], img.shape[0]), flags=cv2.INTER_CUBIC)
-
-                pts = np.array([[pt1], [pt2]], dtype=np.float32)
-                pts_rot = cv2.transform(pts, M)
-                x1r, y1r = pts_rot[0][0]
-                x2r, y2r = pts_rot[1][0]
-
-                x_min = int(min(x1r, x2r))
-                x_max = int(max(x1r, x2r))
-                y_center = int((y1r + y2r) / 2)
-                y_min = max(0, y_center - line_width // 2)
-                y_max = min(rotated.shape[0], y_center + line_width // 2)
-
-                if x_min >= x_max or y_min >= y_max:
-                    continue
-                roi = rotated[y_min:y_max, x_min:x_max]
-                if roi.size == 0 or roi.shape[0] < 5 or roi.shape[1] < 5:
-                    continue
-
-                # --- Preprocess ROI before OCR ---
-                roi_proc = self.preprocess_roi_for_ocr(roi)
-                #comment out above line and use below line to skip preprocessing
-                #roi_proc = roi
-                ocr_text = pytesseract.image_to_string(roi_proc, config="--psm 6").strip()
-
-                roi_inverted = cv2.rotate(roi, cv2.ROTATE_180)
-                #roi_inverted_proc = self.preprocess_roi_for_ocr(roi_inverted)
-                #comment out above line and use below line to skip preprocessing for inverted
-                roi_inverted_proc = roi_inverted
-                ocr_text_inverted = pytesseract.image_to_string(roi_inverted_proc, config="--psm 6").strip()
-                # ----------------------------------
-
-                all_texts = [ocr_text, ocr_text_inverted]
-                number_matches = []
-                for text in all_texts:
-                    number_matches += re.findall(r"\d{1,4}(?:\.\d{1,3})?\s*['\"]?", text)
-                distances = []
-                for match in number_matches:
-                    num_str = re.sub(r"[^\d.]", "", match)
-                    if '.' in num_str:
-                        try:
-                            distances.append(float(num_str))
-                        except ValueError:
-                            continue
-                distance_sum = sum(distances) if distances else 0.0
-                results.append({
-                    "index": i,
-                    "distance_sum_feet": distance_sum,
-                    "pt1": pt1,
-                    "pt2": pt2,
-                    "pixel_length": math.hypot(pt2[0] - pt1[0], pt2[1] - pt1[1])
-                })
-
-            except Exception as e:
-                print(f"Exception on line {i}: {e}")
-                continue
-
-        # Display results in the Qt table_text widget
-        self.table_text.clear()
-        if results:
-            for result in results:
-                self.table_text.append(f"Contour {result['index']}: Distance sum = {result['distance_sum_feet']:.2f}")
-        else:
-            self.table_text.append("No distances found along decimated contour lines.")
-
-        # Append scale factor to the table
-        if self.SCALE_FACTOR is not None:
-            self.table_text.append(f"\nScale Factor: {self.SCALE_FACTOR:.4f} meters/pixel")
-        else:
-            self.table_text.append("\nScale Factor: Not set")
-
-        return results if results else None
-
-    def Distance_find(self, ocr_results):
-        """
-        Sum all distances and update GUI.
-        Returns: total_distance, array of all distances
-        """
-        all_distances = []
-        for r in ocr_results:
-            all_distances.extend(r["distances"])
-        total_distance = sum(all_distances)
-        self.distance_label.setText(f"Measured Distance: {total_distance:.2f}")
-        self.distance_candidates = all_distances
-        return total_distance, all_distances
-    
-    def create_roi_overlay(self, roi_boxes, image_shape):
-        """
-        Draws ROI boxes as overlays for display.
-        roi_boxes: list of np.int32 corner arrays
-        image_shape: shape of the image to overlay on
-        Returns: overlay image
-        """
-        overlay = np.zeros(image_shape, dtype=np.uint8)
-        for box in roi_boxes:
-            cv2.polylines(overlay, [box], isClosed=True, color=(0, 255, 255), thickness=2)
-        return overlay
-
-    def sort_clockwise(self, points):
-        if not points:
-            return []
-
-        # Compute center of all points
-        cx = np.mean([pt[0] for _, pt in points])
-        cy = np.mean([pt[1] for _, pt in points])
-
-        def angle(p):
-            return np.arctan2(p[1] - cy, p[0] - cx)
-
-        return sorted(points, key=lambda x: angle(x[1]))
-  
-    def enable_brown_line_mode(self):
-        self.brown_line_mode = True
-        self.brown_line_points = []
-        self.statusBar().showMessage("Brown line mode: Click two points to add a brown line (snaps to nearest contour).")
-        self.canvas.left_click.disconnect()
-        self.canvas.left_click.connect(self.brown_line_click)
-        self.canvas.mouse_move.connect(self.brown_line_mouse_move)
-
-    def brown_line_click(self, x, y):
-        img_x, img_y = self.canvas_to_image_coords(x, y)
-        snap_x, snap_y = self.snap_to_nearest_contour((img_x, img_y))
-        self.brown_line_points.append((snap_x, snap_y))
-        if len(self.brown_line_points) == 1:
-            # Draw blue snap indicator
-            self.draw_snap_indicator((snap_x, snap_y))
-        elif len(self.brown_line_points) == 2:
-            # Add the brown line
-            self.brown_lines.append(tuple(self.brown_line_points))
-            self.brown_line_mode = False
-            self.statusBar().showMessage("Brown line added.")
-            self.brown_line_points = []
-            self.update_canvas_image()
-            # Restore normal left click
-            self.set_default_left_click()
-            self.canvas.mouse_move.disconnect(self.brown_line_mouse_move)
-
-    def brown_line_mouse_move(self, x, y):
-        if not self.brown_line_mode or len(self.brown_line_points) >= 2:
-            return
-        img_x, img_y = self.canvas_to_image_coords(x, y)
-        snap_x, snap_y = self.snap_to_nearest_contour((img_x, img_y))
-        self.draw_snap_indicator((snap_x, snap_y))
-
-    def snap_to_nearest_contour(self, pt):
-        # Snap to nearest point on any contour (decimated_contour)
-        if self.decimated_contour is None:
-            return pt
-        contour = self.decimated_contour.reshape(-1, 2)
-        dists = np.linalg.norm(contour - np.array(pt), axis=1)
-        idx = np.argmin(dists)
-        return tuple(contour[idx])
-
-    def draw_snap_indicator(self, pt):
-        # Draw a blue circle at pt on the canvas, with larger radius and thinner outline
-        self.update_canvas_image()  # Redraw base image
-        pixmap = self.canvas.pixmap().copy()
-        from PyQt5.QtGui import QPainter, QPen
-        from PyQt5.QtCore import QPoint
-        qp = QPainter(pixmap)
-        pen = QPen(QColor("blue"))
-        pen.setWidth(4)  # Thinner outline
-        qp.setPen(pen)
-        canvas_x, canvas_y = self.image_to_canvas_coords(pt[0], pt[1])
-        qp.drawEllipse(QPoint(canvas_x, canvas_y), 12, 12)  # Larger radius
-        qp.end()
-        self.canvas.setPixmap(pixmap)
-            # Optionally highlight the nearest segment
-        if self.decimated_contour is not None:
-            contour = self.decimated_contour.reshape(-1, 2)
-            dists = np.linalg.norm(contour - np.array(pt), axis=1)
-            idx = np.argmin(dists)
-            pt1 = contour[idx]
-            pt2 = contour[(idx + 1) % len(contour)]
-            pen_line = QPen(QColor("blue"))
-            pen_line.setWidth(2)
-            qp.setPen(pen_line)
-            x1, y1 = self.image_to_canvas_coords(pt1[0], pt1[1])
-            x2, y2 = self.image_to_canvas_coords(pt2[0], pt2[1])
-            qp.drawLine(x1, y1, x2, y2)
-
-    def image_to_canvas_coords(self, img_x, img_y):
-        # Inverse of canvas_to_image_coords
-        canvas_w, canvas_h = self.canvas.width(), self.canvas.height()
-        img_h, img_w = self.original_image.shape[:2]
-        scale = self.zoom_level
-        new_w = int(img_w * scale)
-        new_h = int(img_h * scale)
-        img_x0 = (canvas_w - new_w) // 2 + self.pan_x
-        img_y0 = (canvas_h - new_h) // 2 + self.pan_y
-        canvas_x = int(img_x * scale + img_x0)
-        canvas_y = int(img_y * scale + img_y0)
-        return canvas_x, canvas_y
-
-    def robust_scale_factor(self, pixel_lengths, real_distances_meters):
-        """
-        Robustly calculate scale factor (meters per pixel) using least squares and outlier rejection.
-        Returns: scale_factor, pixel_scale, inlier_mask
-        """
-        import numpy as np
-        pixel_lengths = np.array(pixel_lengths)
-        real_distances_meters = np.array(real_distances_meters)
-        if len(pixel_lengths) < 2 or len(real_distances_meters) < 2:
-            return None, None, None
-
-        # Linear fit: real_distance = scale_factor * pixel_length
-        A = np.vstack([pixel_lengths, np.ones(len(pixel_lengths))]).T
-        result = np.linalg.lstsq(A, real_distances_meters, rcond=None)
-        scale_factor, intercept = result[0]
-
-        # Calculate residuals
-        predicted = scale_factor * pixel_lengths + intercept
-        residuals = real_distances_meters - predicted
-        std_res = np.std(residuals)
-
-        # Identify inliers (within 2 standard deviations)
-        inlier_mask = np.abs(residuals) < 2 * std_res
-
-        # Refit using only inliers
-        if np.sum(inlier_mask) >= 2:
-            A_in = np.vstack([pixel_lengths[inlier_mask], np.ones(np.sum(inlier_mask))]).T
-            result_in = np.linalg.lstsq(A_in, real_distances_meters[inlier_mask], rcond=None)
-            scale_factor, intercept = result_in[0]
-            pixel_scale = 1.0 / scale_factor if scale_factor != 0 else None
-        else:
-            pixel_scale = None
-
-        return scale_factor, pixel_scale, inlier_mask
-
-    def on_aggressiveness_slider_changed(self):
-        # Restart the timer every time the slider value changes
-        self.aggressiveness_timer.start(200)
-
-    def on_contrast_slider_changed(self):
-        self.contrast_timer.start(200)
-
-    def on_pixel_slider_changed(self):
-        self.kernel_timer.start(200)
-
-    def on_simplify_slider_changed(self):
-        self.simplify_timer.start(200)
-
-    def find_best_contrast_for_ocr(self, roi=None, contrast_range=None):
-        """
-        Try different contrast settings and pick the one that gives the best OCR result.
-        roi: region of interest (numpy array). If None, use the whole original image.
-        contrast_range: list or range of contrast values to try (default: 60 to 180).
-        Returns: best_contrast, best_text, best_score
-        """
-        if roi is None:
-            roi = self.original_image
-        if contrast_range is None:
-            contrast_range = range(60, 181, 10)  # Try values from 60 to 180
-
-        best_score = -1
-        best_contrast = None
-        best_text = ""
-        for contrast in contrast_range:
-            alpha = contrast / 100.0
-            enhanced = cv2.convertScaleAbs(roi, alpha=alpha, beta=0)
-            # Preprocess for OCR if needed
-            gray = cv2.cvtColor(enhanced, cv2.COLOR_BGR2GRAY) if len(enhanced.shape) == 3 else enhanced
-            text = pytesseract.image_to_string(gray, config="--psm 6")
-            # Score: count number of digits found (or use another metric)
-            score = len(re.findall(r"\d", text))
-            if score > best_score:
-                best_score = score
-                best_contrast = contrast
-                best_text = text
-        return best_contrast, best_text, best_score
-
-    def auto_contrast_for_ocr(self):
-        best_contrast, best_text, best_score = self.find_best_contrast_for_ocr()
-        if best_contrast is not None:
-            self.contrast_slider['slider'].setValue(best_contrast)
-            self.statusBar().showMessage(f"Best contrast for OCR: {best_contrast} (score: {best_score})")
-            print("Best OCR text sample:", best_text)
-        else:
-            self.statusBar().showMessage("Auto contrast failed to find a better setting.")
-
-    def enable_auto_contrast_roi_mode(self):
-        self.statusBar().showMessage("Click near a contour segment to select ROI for auto contrast.")
-        try:
-            self.canvas.left_click.disconnect(self.add_seed_point)
-        except Exception:
-            pass
-        self.canvas.left_click.connect(self.auto_contrast_roi_pick)
-
-    def paintEvent(self, event):
-        super().paintEvent(event)
-        if getattr(self, 'roi_selecting', False) and hasattr(self, 'roi_start') and hasattr(self, 'roi_end'):
-            painter = QPainter(self)
-            pen = QPen(QColor(255, 255, 0, 128))  # Semi-transparent yellow
-            pen.setWidth(2)
-            painter.setPen(pen)
-            x1, y1 = self.roi_start
-            x2, y2 = self.roi_end
-            painter.drawRect(min(x1, x2), min(y1, y2), abs(x2 - x1), abs(y2 - y1))
-            painter.end()
-
-    def auto_contrast_roi_pick(self, x, y):
-        img_x, img_y = self.canvas_to_image_coords(x, y)
-        if self.decimated_contour is None:
-            self.statusBar().showMessage("No contour available.")
-            return
-
-        contour = self.decimated_contour.reshape(-1, 2)
-        # Find nearest segment
-        min_dist = float('inf')
-        nearest_idx = 0
-        for i in range(len(contour)):
-            pt1 = contour[i]
-            pt2 = contour[(i + 1) % len(contour)]
-            v = np.array(pt2) - np.array(pt1)
-            w = np.array([img_x, img_y]) - np.array(pt1)
-            if np.dot(v, v) == 0:
-                proj = pt1
-            else:
-                t = np.clip(np.dot(w, v) / np.dot(v, v), 0, 1)
-                proj = pt1 + t * v
-            dist = np.linalg.norm(np.array([img_x, img_y]) - proj)
-            if dist < min_dist:
-                min_dist = dist
-                nearest_idx = i
-
-        pt1 = contour[nearest_idx]
-        pt2 = contour[(nearest_idx + 1) % len(contour)]
-        seg_vec = np.array(pt2) - np.array(pt1)
-        seg_len = np.linalg.norm(seg_vec)
-        if seg_len < 1:
-            self.statusBar().showMessage("Contour segment too short.")
-            return
-        seg_dir = seg_vec / seg_len
-        perp_dir = np.array([-seg_dir[1], seg_dir[0]])
-        center = (np.array(pt1) + np.array(pt2)) / 2
-        half_width = 50
-        p1 = center - seg_vec / 2 + perp_dir * half_width
-        p2 = center + seg_vec / 2 + perp_dir * half_width
-        p3 = center + seg_vec / 2 - perp_dir * half_width
-        p4 = center - seg_vec / 2 - perp_dir * half_width
-        roi_corners = np.array([p1, p2, p3, p4], dtype=np.float32)
-        dst_rect = np.array([
-            [0, 0],
-            [int(seg_len), 0],
-            [int(seg_len), 100],
-            [0, 100]
-        ], dtype=np.float32)
-        M = cv2.getPerspectiveTransform(roi_corners, dst_rect)
-        roi = cv2.warpPerspective(self.original_image, M, (int(seg_len), 100))
-
-        best_contrast, best_text, best_score = self.find_best_contrast_for_ocr(roi)
-        if best_contrast is not None:
-            self.contrast_slider['slider'].setValue(best_contrast)
-            self.statusBar().showMessage(f"Best contrast for OCR (ROI): {best_contrast} (score: {best_score})")
-            print("Best OCR text sample (ROI):", best_text)
-        else:
-            self.statusBar().showMessage("Auto contrast failed to find a better setting for ROI.")
-
-        # Draw ROI for feedback
-        overlay = self.image.copy() if self.image is not None else self.original_image.copy()
-        roi_poly = roi_corners.astype(np.int32).reshape((-1, 1, 2))
-        cv2.polylines(overlay, [roi_poly], isClosed=True, color=(0, 255, 255), thickness=2)
-        self.image = overlay
-        self.update_canvas_image()
-
-        # Restore normal left click
-        self.set_default_left_click()
-    
-    def on_extract_distances_clicked(self):
-        self.last_contour_distances = self.extract_text_along_decimated_lines()
-    
-    def set_default_left_click(self):
-        try:
-            self.canvas.left_click.disconnect(self.auto_contrast_roi_pick)
-        except Exception:
-            pass
-        try:
-            self.canvas.left_click.disconnect(self.brown_line_click)
-        except Exception:
-            pass
-        try:
-            self.canvas.left_click.disconnect(self.add_seed_point)
-        except Exception:
-            pass
-        self.canvas.left_click.connect(self.add_seed_point)
-
-    def on_brightness_slider_changed(self):
-        self.update_canvas_image()
-    
-    def reset_all_sliders(self):
-        # Reset all sliders to their default values
-        self.aggressiveness_slider['slider'].setValue(25)
-        self.pixel_slider['slider'].setValue(2)
-        self.contrast_slider['slider'].setValue(100)
-        # self.kernel_slider['slider'].setValue(5)
-        # self.lambda_slider['slider'].setValue(0)
-        self.simplify_slider['slider'].setValue(5)
-        self.brightness_slider['slider'].setValue(0)
-
-        # Also update the displayed values
-        self.aggressiveness_slider['value_label'].setText("25")
-        self.pixel_slider['value_label'].setText("2")
-        self.contrast_slider['value_label'].setText("100")
-        # self.kernel_slider['value_label'].setText("5")
-        # self.lambda_slider['value_label'].setText("0")
-        self.simplify_slider['value_label'].setText("5")
-        self.brightness_slider['value_label'].setText("0")
-
-                # Reset other relevant states if necessary
-        self.mask = None
-        self.seed_points = []
-        self.image = self.original_image.copy() if self.original_image is not None else None
+        # Optionally, store the offset contour for drawing
+        self.simplified4_offset_contour = offset_contour
 
         self.update_canvas_image()
-
-    @staticmethod
-    def apply_contrast_brightness_preserve_white(img, alpha, beta):
-        img = img.astype(np.float32)
-        # Save mask of white pixels
-        white_mask = np.all(img == 255, axis=2) if img.ndim == 3 else (img == 255)
-        # Apply contrast and brightness
-        img = img * alpha + beta
-        # Restore white pixels
-        if img.ndim == 3:
-            img[white_mask] = 255
-        else:
-            img[white_mask] = 255
-        # Clip to [0, 255] and convert back to uint8
-        img = np.clip(img, 0, 255).astype(np.uint8)
-        return img
-   
-    def create_simplified_contour_4(self):
-        if self.mask is None or np.count_nonzero(self.mask) == 0:
-            return
-
-        # 1. Offset outer contour by 4*pixel_slider
-        mask_orig = (self.mask > 0).astype(np.uint8) * 255
-        contours, _ = cv2.findContours(mask_orig, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            return
-        outer_contour = max(contours, key=cv2.contourArea)
-        offset_amt = max(1, int(self.pixel_slider['slider'].value() * 4))
-        kernel = np.ones((offset_amt, offset_amt), np.uint8)
-        mask_outer_offset = cv2.dilate(mask_orig, kernel, iterations=1)
-        contours_offset, _ = cv2.findContours(mask_outer_offset, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours_offset:
-            return
-        outer_offset_contour = max(contours_offset, key=cv2.contourArea)
-
-        # 2. Create between_image: mask inside by inner mask, outside by outer mask
-        between_image = self.original_image.copy()
-        mask_inner = np.zeros_like(mask_orig)
-        cv2.drawContours(mask_inner, [outer_contour], -1, 255, thickness=cv2.FILLED)
-        between_image[mask_inner > 0] = 255
-        mask_outer = np.zeros_like(mask_orig)
-        cv2.drawContours(mask_outer, [outer_offset_contour], -1, 255, thickness=cv2.FILLED)
-        mask_outside = cv2.bitwise_not(mask_outer)
-        between_image[mask_outside > 0] = 255
-
-        # 3. Invert between_image
-        between_image_inv = cv2.bitwise_not(cv2.cvtColor(between_image, cv2.COLOR_BGR2GRAY))
-
-        # 4. Skeletonize
-        skeleton = skeletonize(between_image_inv > 0)
-        skeleton_uint8 = (skeleton * 255).astype(np.uint8)
-        self.simplified4_skeleton_img = skeleton_uint8
-
-        # 5. Find skeleton contours and simplify with Douglas-Peucker
-        min_length = int(self.pixel_slider['slider'].value() * 2)
-        skeleton_contours, _ = cv2.findContours(self.simplified4_skeleton_img, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
-        simplified_contours = []
-        epsilon_factor = self.simplify_slider['slider'].value() / 100.0  # Use simplify slider
-
-        for cnt in skeleton_contours:
-            if len(cnt) < min_length:
-                continue
-            arc_len = cv2.arcLength(cnt, False)
-            epsilon = epsilon_factor * arc_len
-            simplified = cv2.approxPolyDP(cnt, epsilon, False)
-            if len(simplified) >= 2:
-                simplified_contours.append(simplified)
-
-        # Find the most prominent (longest) contour(s) parallel to mask_outer
-        # Here, we select the largest by arc length
-        N = 5
-        outer_pts = outer_contour.reshape(-1, 2)
-        contour_scores = []
-        for c in simplified_contours:
-            pts = c.reshape(-1, 2)
-            # Mean distance to outer contour
-            dists = [np.min(np.linalg.norm(outer_pts - pt, axis=1)) for pt in pts]
-            mean_dist = np.mean(dists)
-            length = cv2.arcLength(c, False)
-            # Score: prefer long and close to outer contour
-            score = length / (mean_dist + 1e-5)
-            contour_scores.append(score)
-        sorted_indices = np.argsort(contour_scores)[::-1]
-        N = 5  # or any number you want
-        self.simplified4_prominent_contours = [simplified_contours[i] for i in sorted_indices[:N]]
-
-        self.simplified4_fitted_lines = []  # Optionally clear lines
-        self.simplified4_fitted_curves = []
-        self.update_canvas_image()
-    
-    def create_simplified_contour(self):
-        if self.mask is None or np.count_nonzero(self.mask) == 0:
-            return
-
-        # Apply morphological closing/opening with kernel size from slider
-        kernel_size = self.pixel_slider['slider'].value()
-        if kernel_size > 1:
-            kernel = np.ones((kernel_size, kernel_size), np.uint8)
-            mask_for_contours = cv2.morphologyEx(self.mask, cv2.MORPH_CLOSE, kernel)
-        else:
-            mask_for_contours = self.mask.copy()
-
-        if mask_for_contours.max() > 1:
-            mask_for_contours = (mask_for_contours > 0).astype(np.uint8) * 255
-        contours, _ = cv2.findContours(mask_for_contours, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
-        if not contours:
-            return
-
-        largest_contour = max(contours, key=cv2.contourArea)
-        slider_value = 5 # self.simplify_slider['slider'].value()  # 1-100
-        epsilon = (slider_value / 1000.0) * cv2.arcLength(largest_contour, True)  # 0.001–0.1 * arcLength
-        simplified = cv2.approxPolyDP(largest_contour, epsilon, True)
-
-        print(f"Original points: {len(largest_contour)}, Simplified: {len(simplified)}, Epsilon: {epsilon:.4f}, Kernel: {kernel_size}")
-
-        self.decimated_contour = simplified
-
-        contour_img = self.original_image.copy()
-        cv2.drawContours(contour_img, [simplified], -1, (255, 0, 255), 2)
-        self.image = contour_img
-        self.update_canvas_image()        
-
-    def canvas_to_image_coords(self, x, y):
-        """Convert canvas (widget) coordinates to image coordinates, considering pan and zoom."""
-        canvas_w, canvas_h = self.canvas.width(), self.canvas.height()
-        img_h, img_w = self.original_image.shape[:2]
-        scale = self.zoom_level
-        #do not modify this line - intentional logic
-        new_w = int(img_w * scale)
-        new_h = int(img_h * scale)
-        # Do not modify this line — intentional logic
-        # Calculate top-left of image in canvas 
-        img_x0 = (canvas_w - new_w) // 2 + self.pan_x
-        img_y0 = (canvas_h - new_h) // 2 + self.pan_y
-        # Convert canvas to image coordinates
-        img_x = int((x - img_x0) / scale)
-        img_y = int((y - img_y0) / scale)
-        # Clamp to image bounds
-        img_x = np.clip(img_x, 0, img_w - 1)
-        img_y = np.clip(img_y, 0, img_h - 1)
-        return img_x, img_y
-
-    @staticmethod
-    def preprocess_roi_for_ocr(roi):
-        # Convert to grayscale
-        if len(roi.shape) == 3 and roi.shape[2] == 3:
-            roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        else:
-            roi_gray = roi
-
-        # Denoise
-        roi_denoised = cv2.fastNlMeansDenoising(roi_gray, None, h=30, templateWindowSize=7, searchWindowSize=21)
-
-        # Sharpen
-        kernel = np.array([[0, -1, 0], [-1, 5,-1], [0, -1, 0]])
-        roi_sharp = cv2.filter2D(roi_denoised, -1, kernel)
-
-        # Preprocess ROI to connect characters
-        kernel = np.ones((2, 2), np.uint8)
-        roi_closed = cv2.morphologyEx(roi, cv2.MORPH_CLOSE, kernel)
-
-        # Contrast enhancement
-        roi_eq = cv2.equalizeHist(roi_sharp)
-
-        # Threshold (try both adaptive and binary)
-        roi_thresh = roi_eq 
-        # Uncomment below to try adaptive thresholding and comment above line
-        # roi_thresh = cv2.adaptiveThreshold(
-        #     roi_eq, 255,
-        #     cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        #     cv2.THRESH_BINARY,
-        #     11, 2
-        # )
-        # Optionally try: _, roi_thresh = cv2.threshold(roi_eq, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-        # Upscale more aggressively
-        roi_up = cv2.resize(roi_thresh, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
-
-        # Pad horizontally
-        pad = 20
-        roi_up = cv2.copyMakeBorder(roi_up, 0, 0, pad, pad, cv2.BORDER_CONSTANT, value=255)
-
-        # --- Output the preprocessed ROI image ---
-        output_dir = "roi_debug_output"
-        os.makedirs(output_dir, exist_ok=True)
-        filename = f"roi_{int(time.time() * 1000)}.png"
-        output_path = os.path.join(output_dir, filename)
-        cv2.imwrite(output_path, roi_up)
-        print(f"Saved preprocessed ROI to {output_path}")
-
-        return roi_up
-
-    def extract_text_along_decimated_lines(self):
-        if self.image is None or self.decimated_contour is None:
-            return None
-
-        img = self.image.copy()
-        contour = self.decimated_contour
-        line_width = 100
-        results = []
-
-        # Use the largest contour for distance calculation
-        if hasattr(self, 'outer_contour') and self.outer_contour is not None:
-            main_contour = max(self.outer_contour, key=cv2.contourArea)
-        else:
-            main_contour = contour
-
-        max_distance_to_contour = 100  # pixels
-
-        for i in range(len(contour)):
-            pt1 = contour[i][0]
-            pt2 = contour[(i + 1) % len(contour)][0]
-
-            dx = pt2[0] - pt1[0]
-            dy = pt2[1] - pt1[1]
-            length = int(math.hypot(dx, dy))
-            if length < 10:
-                continue
-
-            # Midpoint of the segment
-            mx = int((pt1[0] + pt2[0]) / 2)
-            my = int((pt1[1] + pt2[1]) / 2)
-
-            # Distance from midpoint to contour
-            dist = cv2.pointPolygonTest(main_contour, (mx, my), True)
-            if abs(dist) > max_distance_to_contour:
-                continue  # Skip if farther than 100 pixels
-
-            angle = math.degrees(math.atan2(dy, dx))
-            cx = (pt1[0] + pt2[0]) / 2.0
-            cy = (pt1[1] + pt2[1]) / 2.0
-
-            try:
-                M = cv2.getRotationMatrix2D((cx, cy), angle, 1.0)
-                rotated = cv2.warpAffine(img, M, (img.shape[1], img.shape[0]), flags=cv2.INTER_CUBIC)
-
-                pts = np.array([[pt1], [pt2]], dtype=np.float32)
-                pts_rot = cv2.transform(pts, M)
-                x1r, y1r = pts_rot[0][0]
-                x2r, y2r = pts_rot[1][0]
-
-                x_min = int(min(x1r, x2r))
-                x_max = int(max(x1r, x2r))
-                y_center = int((y1r + y2r) / 2)
-                y_min = max(0, y_center - line_width // 2)
-                y_max = min(rotated.shape[0], y_center + line_width // 2)
-
-                if x_min >= x_max or y_min >= y_max:
-                    continue
-                roi = rotated[y_min:y_max, x_min:x_max]
-                if roi.size == 0 or roi.shape[0] < 5 or roi.shape[1] < 5:
-                    continue
-
-                # --- Preprocess ROI before OCR ---
-                roi_proc = self.preprocess_roi_for_ocr(roi)
-                #comment out above line and use below line to skip preprocessing
-                #roi_proc = roi
-                ocr_text = pytesseract.image_to_string(roi_proc, config="--psm 6").strip()
-
-                roi_inverted = cv2.rotate(roi, cv2.ROTATE_180)
-                #roi_inverted_proc = self.preprocess_roi_for_ocr(roi_inverted)
-                #comment out above line and use below line to skip preprocessing for inverted
-                roi_inverted_proc = roi_inverted
-                ocr_text_inverted = pytesseract.image_to_string(roi_inverted_proc, config="--psm 6").strip()
-                # ----------------------------------
-
-                all_texts = [ocr_text, ocr_text_inverted]
-                number_matches = []
-                for text in all_texts:
-                    number_matches += re.findall(r"\d{1,4}(?:\.\d{1,3})?\s*['\"]?", text)
-                distances = []
-                for match in number_matches:
-                    num_str = re.sub(r"[^\d.]", "", match)
-                    if '.' in num_str:
-                        try:
-                            distances.append(float(num_str))
-                        except ValueError:
-                            continue
-                distance_sum = sum(distances) if distances else 0.0
-                results.append({
-                    "index": i,
-                    "distance_sum_feet": distance_sum,
-                    "pt1": pt1,
-                    "pt2": pt2,
-                    "pixel_length": math.hypot(pt2[0] - pt1[0], pt2[1] - pt1[1])
-                })
-
-            except Exception as e:
-                print(f"Exception on line {i}: {e}")
-                continue
-
-        # Display results in the Qt table_text widget
-        self.table_text.clear()
-        if results:
-            for result in results:
-                self.table_text.append(f"Contour {result['index']}: Distance sum = {result['distance_sum_feet']:.2f}")
-        else:
-            self.table_text.append("No distances found along decimated contour lines.")
-
-        # Append scale factor to the table
-        if self.SCALE_FACTOR is not None:
-            self.table_text.append(f"\nScale Factor: {self.SCALE_FACTOR:.4f} meters/pixel")
-        else:
-            self.table_text.append("\nScale Factor: Not set")
-
-        return results if results else None
-
-    def Distance_find(self, ocr_results):
-        """
-        Sum all distances and update GUI.
-        Returns: total_distance, array of all distances
-        """
-        all_distances = []
-        for r in ocr_results:
-            all_distances.extend(r["distances"])
-        total_distance = sum(all_distances)
-        self.distance_label.setText(f"Measured Distance: {total_distance:.2f}")
-        self.distance_candidates = all_distances
-        return total_distance, all_distances
-    
-    def create_roi_overlay(self, roi_boxes, image_shape):
-        """
-        Draws ROI boxes as overlays for display.
-        roi_boxes: list of np.int32 corner arrays
-        image_shape: shape of the image to overlay on
-        Returns: overlay image
-        """
-        overlay = np.zeros(image_shape, dtype=np.uint8)
-        for box in roi_boxes:
-            cv2.polylines(overlay, [box], isClosed=True, color=(0, 255, 255), thickness=2)
-        return overlay
-
-    def sort_clockwise(self, points):
-        if not points:
-            return []
-
-        # Compute center of all points
-        cx = np.mean([pt[0] for _, pt in points])
-        cy = np.mean([pt[1] for _, pt in points])
-
-        def angle(p):
-            return np.arctan2(p[1] - cy, p[0] - cx)
-
-        return sorted(points, key=lambda x: angle(x[1]))
-  
-    def enable_brown_line_mode(self):
-        self.brown_line_mode = True
-        self.brown_line_points = []
-        self.statusBar().showMessage("Brown line mode: Click two points to add a brown line (snaps to nearest contour).")
-        self.canvas.left_click.disconnect()
-        self.canvas.left_click.connect(self.brown_line_click)
-        self.canvas.mouse_move.connect(self.brown_line_mouse_move)
-
-    def brown_line_click(self, x, y):
-        img_x, img_y = self.canvas_to_image_coords(x, y)
-        snap_x, snap_y = self.snap_to_nearest_contour((img_x, img_y))
-        self.brown_line_points.append((snap_x, snap_y))
-        if len(self.brown_line_points) == 1:
-            # Draw blue snap indicator
-            self.draw_snap_indicator((snap_x, snap_y))
-        elif len(self.brown_line_points) == 2:
-            # Add the brown line
-            self.brown_lines.append(tuple(self.brown_line_points))
-            self.brown_line_mode = False
-            self.statusBar().showMessage("Brown line added.")
-            self.brown_line_points = []
-            self.update_canvas_image()
-            # Restore normal left click
-            self.set_default_left_click()
-            self.canvas.mouse_move.disconnect(self.brown_line_mouse_move)
-
-    def brown_line_mouse_move(self, x, y):
-        if not self.brown_line_mode or len(self.brown_line_points) >= 2:
-            return
-        img_x, img_y = self.canvas_to_image_coords(x, y)
-        snap_x, snap_y = self.snap_to_nearest_contour((img_x, img_y))
-        self.draw_snap_indicator((snap_x, snap_y))
-
-    def snap_to_nearest_contour(self, pt):
-        # Snap to nearest point on any contour (decimated_contour)
-        if self.decimated_contour is None:
-            return pt
-        contour = self.decimated_contour.reshape(-1, 2)
-        dists = np.linalg.norm(contour - np.array(pt), axis=1)
-        idx = np.argmin(dists)
-        return tuple(contour[idx])
-
-    def draw_snap_indicator(self, pt):
-        # Draw a blue circle at pt on the canvas, with larger radius and thinner outline
-        self.update_canvas_image()  # Redraw base image
-        pixmap = self.canvas.pixmap().copy()
-        from PyQt5.QtGui import QPainter, QPen
-        from PyQt5.QtCore import QPoint
-        qp = QPainter(pixmap)
-        pen = QPen(QColor("blue"))
-        pen.setWidth(4)  # Thinner outline
-        qp.setPen(pen)
-        canvas_x, canvas_y = self.image_to_canvas_coords(pt[0], pt[1])
-        qp.drawEllipse(QPoint(canvas_x, canvas_y), 12, 12)  # Larger radius
-        qp.end()
-        self.canvas.setPixmap(pixmap)
-            # Optionally highlight the nearest segment
-        if self.decimated_contour is not None:
-            contour = self.decimated_contour.reshape(-1, 2)
-            dists = np.linalg.norm(contour - np.array(pt), axis=1)
-            idx = np.argmin(dists)
-            pt1 = contour[idx]
-            pt2 = contour[(idx + 1) % len(contour)]
-            pen_line = QPen(QColor("blue"))
-            pen_line.setWidth(2)
-            qp.setPen(pen_line)
-            x1, y1 = self.image_to_canvas_coords(pt1[0], pt1[1])
-            x2, y2 = self.image_to_canvas_coords(pt2[0], pt2[1])
-            qp.drawLine(x1, y1, x2, y2)
-
-    def image_to_canvas_coords(self, img_x, img_y):
-        # Inverse of canvas_to_image_coords
-        canvas_w, canvas_h = self.canvas.width(), self.canvas.height()
-        img_h, img_w = self.original_image.shape[:2]
-        scale = self.zoom_level
-        new_w = int(img_w * scale)
-        new_h = int(img_h * scale)
-        img_x0 = (canvas_w - new_w) // 2 + self.pan_x
-        img_y0 = (canvas_h - new_h) // 2 + self.pan_y
-        canvas_x = int(img_x * scale + img_x0)
-        canvas_y = int(img_y * scale + img_y0)
-        return canvas_x, canvas_y
-
-    def robust_scale_factor(self, pixel_lengths, real_distances_meters):
-        """
-        Robustly calculate scale factor (meters per pixel) using least squares and outlier rejection.
-        Returns: scale_factor, pixel_scale, inlier_mask
-        """
-        import numpy as np
-        pixel_lengths = np.array(pixel_lengths)
-        real_distances_meters = np.array(real_distances_meters)
-        if len(pixel_lengths) < 2 or len(real_distances_meters) < 2:
-            return None, None, None
-
-        # Linear fit: real_distance = scale_factor * pixel_length
-        A = np.vstack([pixel_lengths, np.ones(len(pixel_lengths))]).T
-        result = np.linalg.lstsq(A, real_distances_meters, rcond=None)
-        scale_factor, intercept = result[0]
-
-        # Calculate residuals
-        predicted = scale_factor * pixel_lengths + intercept
-        residuals = real_distances_meters - predicted
-        std_res = np.std(residuals)
-
-        # Identify inliers (within 2 standard deviations)
-        inlier_mask = np.abs(residuals) < 2 * std_res
-
-        # Refit using only inliers
-        if np.sum(inlier_mask) >= 2:
-            A_in = np.vstack([pixel_lengths[inlier_mask], np.ones(np.sum(inlier_mask))]).T
-            result_in = np.linalg.lstsq(A_in, real_distances_meters[inlier_mask], rcond=None)
-            scale_factor, intercept = result_in[0]
-            pixel_scale = 1.0 / scale_factor if scale_factor != 0 else None
-        else:
-            pixel_scale = None
-
-        return scale_factor, pixel_scale, inlier_mask
-
-    def on_aggressiveness_slider_changed(self):
-        # Restart the timer every time the slider value changes
-        self.aggressiveness_timer.start(200)
-
-    def on_contrast_slider_changed(self):
-        self.contrast_timer.start(200)
-
-    def on_pixel_slider_changed(self):
-        self.kernel_timer.start(200)
-
-    def on_simplify_slider_changed(self):
-        self.simplify_timer.start(200)
-
-    def find_best_contrast_for_ocr(self, roi=None, contrast_range=None):
-        """
-        Try different contrast settings and pick the one that gives the best OCR result.
-        roi: region of interest (numpy array). If None, use the whole original image.
-        contrast_range: list or range of contrast values to try (default: 60 to 180).
-        Returns: best_contrast, best_text, best_score
-        """
-        if roi is None:
-            roi = self.original_image
-        if contrast_range is None:
-            contrast_range = range(60, 181, 10)  # Try values from 60 to 180
-
-        best_score = -1
-        best_contrast = None
-        best_text = ""
-        for contrast in contrast_range:
-            alpha = contrast / 100.0
-            enhanced = cv2.convertScaleAbs(roi, alpha=alpha, beta=0)
-            # Preprocess for OCR if needed
-            gray = cv2.cvtColor(enhanced, cv2.COLOR_BGR2GRAY) if len(enhanced.shape) == 3 else enhanced
-            text = pytesseract.image_to_string(gray, config="--psm 6")
-            # Score: count number of digits found (or use another metric)
-            score = len(re.findall(r"\d", text))
-            if score > best_score:
-                best_score = score
-                best_contrast = contrast
-                best_text = text
-        return best_contrast, best_text, best_score
-
-    def auto_contrast_for_ocr(self):
-        best_contrast, best_text, best_score = self.find_best_contrast_for_ocr()
-        if best_contrast is not None:
-            self.contrast_slider['slider'].setValue(best_contrast)
-            self.statusBar().showMessage(f"Best contrast for OCR: {best_contrast} (score: {best_score})")
-            print("Best OCR text sample:", best_text)
-        else:
-            self.statusBar().showMessage("Auto contrast failed to find a better setting.")
-
-    def enable_auto_contrast_roi_mode(self):
-        self.statusBar().showMessage("Click near a contour segment to select ROI for auto contrast.")
-        try:
-            self.canvas.left_click.disconnect(self.add_seed_point)
-        except Exception:
-            pass
-        self.canvas.left_click.connect(self.auto_contrast_roi_pick)
-
-    def paintEvent(self, event):
-        super().paintEvent(event)
-        if getattr(self, 'roi_selecting', False) and hasattr(self, 'roi_start') and hasattr(self, 'roi_end'):
-            painter = QPainter(self)
-            pen = QPen(QColor(255, 255, 0, 128))  # Semi-transparent yellow
-            pen.setWidth(2)
-            painter.setPen(pen)
-            x1, y1 = self.roi_start
-            x2, y2 = self.roi_end
-            painter.drawRect(min(x1, x2), min(y1, y2), abs(x2 - x1), abs(y2 - y1))
-            painter.end()
-
-    def auto_contrast_roi_pick(self, x, y):
-        img_x, img_y = self.canvas_to_image_coords(x, y)
-        if self.decimated_contour is None:
-            self.statusBar().showMessage("No contour available.")
-            return
-
-        contour = self.decimated_contour.reshape(-1, 2)
-        # Find nearest segment
-        min_dist = float('inf')
-        nearest_idx = 0
-        for i in range(len(contour)):
-            pt1 = contour[i]
-            pt2 = contour[(i + 1) % len(contour)]
-            v = np.array(pt2) - np.array(pt1)
-            w = np.array([img_x, img_y]) - np.array(pt1)
-            if np.dot(v, v) == 0:
-                proj = pt1
-            else:
-                t = np.clip(np.dot(w, v) / np.dot(v, v), 0, 1)
-                proj = pt1 + t * v
-            dist = np.linalg.norm(np.array([img_x, img_y]) - proj)
-            if dist < min_dist:
-                min_dist = dist
-                nearest_idx = i
-
-        pt1 = contour[nearest_idx]
-        pt2 = contour[(nearest_idx + 1) % len(contour)]
-        seg_vec = np.array(pt2) - np.array(pt1)
-        seg_len = np.linalg.norm(seg_vec)
-        if seg_len < 1:
-            self.statusBar().showMessage("Contour segment too short.")
-            return
-        seg_dir = seg_vec / seg_len
-        perp_dir = np.array([-seg_dir[1], seg_dir[0]])
-        center = (np.array(pt1) + np.array(pt2)) / 2
-        half_width = 50
-        p1 = center - seg_vec / 2 + perp_dir * half_width
-        p2 = center + seg_vec / 2 + perp_dir * half_width
-        p3 = center + seg_vec / 2 - perp_dir * half_width
-        p4 = center - seg_vec / 2 - perp_dir * half_width
-        roi_corners = np.array([p1, p2, p3, p4], dtype=np.float32)
-        dst_rect = np.array([
-            [0, 0],
-            [int(seg_len), 0],
-            [int(seg_len), 100],
-            [0, 100]
-        ], dtype=np.float32)
-        M = cv2.getPerspectiveTransform(roi_corners, dst_rect)
-        roi = cv2.warpPerspective(self.original_image, M, (int(seg_len), 100))
-
-        best_contrast, best_text, best_score = self.find_best_contrast_for_ocr(roi)
-        if best_contrast is not None:
-            self.contrast_slider['slider'].setValue(best_contrast)
-            self.statusBar().showMessage(f"Best contrast for OCR (ROI): {best_contrast} (score: {best_score})")
-            print("Best OCR text sample (ROI):", best_text)
-        else:
-            self.statusBar().showMessage("Auto contrast failed to find a better setting for ROI.")
-
-        # Draw ROI for feedback
-        overlay = self.image.copy() if self.image is not None else self.original_image.copy()
-        roi_poly = roi_corners.astype(np.int32).reshape((-1, 1, 2))
-        cv2.polylines(overlay, [roi_poly], isClosed=True, color=(0, 255, 255), thickness=2)
-        self.image = overlay
-        self.update_canvas_image()
-
-        # Restore normal left click
-        self.set_default_left_click()
-    
-    def on_extract_distances_clicked(self):
-        self.last_contour_distances = self.extract_text_along_decimated_lines()
-    
-    def set_default_left_click(self):
-        try:
-            self.canvas.left_click.disconnect(self.auto_contrast_roi_pick)
-        except Exception:
-            pass
-        try:
-            self.canvas.left_click.disconnect(self.brown_line_click)
-        except Exception:
-            pass
-        try:
-            self.canvas.left_click.disconnect(self.add_seed_point)
-        except Exception:
-            pass
-        self.canvas.left_click.connect(self.add_seed_point)
-
-    def on_brightness_slider_changed(self):
-        self.update_canvas_image()
-    
-    def reset_all_sliders(self):
-        # Reset all sliders to their default values
-        self.aggressiveness_slider['slider'].setValue(25)
-        self.pixel_slider['slider'].setValue(2)
-        self.contrast_slider['slider'].setValue(100)
-        # self.kernel_slider['slider'].setValue(5)
-        # self.lambda_slider['slider'].setValue(0)
-        self.simplify_slider['slider'].setValue(5)
-        self.brightness_slider['slider'].setValue(0)
-
-        # Also update the displayed values
-        self.aggressiveness_slider['value_label'].setText("25")
-        self.pixel_slider['value_label'].setText("2")
-        self.contrast_slider['value_label'].setText("100")
-        # self.kernel_slider['value_label'].setText("5")
-        # self.lambda_slider['value_label'].setText("0")
-        self.simplify_slider['value_label'].setText("5")
-        self.brightness_slider['value_label'].setText("0")
-
-                # Reset other relevant states if necessary
-        self.mask = None
-        self.seed_points = []
-        self.image = self.original_image.copy() if self.original_image is not None else None
-
-        self.update_canvas_image()
-
-    @staticmethod
-    def apply_contrast_brightness_preserve_white(img, alpha, beta):
-        img = img.astype(np.float32)
-        # Save mask of white pixels
-        white_mask = np.all(img == 255, axis=2) if img.ndim == 3 else (img == 255)
-        # Apply contrast and brightness
-        img = img * alpha + beta
-        # Restore white pixels
-        if img.ndim == 3:
-            img[white_mask] = 255
-        else:
-            img[white_mask] = 255
-        # Clip to [0, 255] and convert back to uint8
-        img = np.clip(img, 0, 255).astype(np.uint8)
-        return img
-   
-    def create_simplified_contour_4(self):
-        if self.mask is None or np.count_nonzero(self.mask) == 0:
-            return
-
-        # 1. Offset outer contour by 4*pixel_slider
-        mask_orig = (self.mask > 0).astype(np.uint8) * 255
-        contours, _ = cv2.findContours(mask_orig, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            return
-        outer_contour = max(contours, key=cv2.contourArea)
-        offset_amt = max(1, int(self.pixel_slider['slider'].value() * 4))
-        kernel = np.ones((offset_amt, offset_amt), np.uint8)
-        mask_outer_offset = cv2.dilate(mask_orig, kernel, iterations=1)
-        contours_offset, _ = cv2.findContours(mask_outer_offset, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours_offset:
-            return
-        outer_offset_contour = max(contours_offset, key=cv2.contourArea)
-
-        # 2. Create between_image: mask inside by inner mask, outside by outer mask
-        between_image = self.original_image.copy()
-        mask_inner = np.zeros_like(mask_orig)
-        cv2.drawContours(mask_inner, [outer_contour], -1, 255, thickness=cv2.FILLED)
-        between_image[mask_inner > 0] = 255
-        mask_outer = np.zeros_like(mask_orig)
-        cv2.drawContours(mask_outer, [outer_offset_contour], -1, 255, thickness=cv2.FILLED)
-        mask_outside = cv2.bitwise_not(mask_outer)
-        between_image[mask_outside > 0] = 255
-
-        # 3. Invert between_image
-        between_image_inv = cv2.bitwise_not(cv2.cvtColor(between_image, cv2.COLOR_BGR2GRAY))
-
-        # 4. Skeletonize
-        skeleton = skeletonize(between_image_inv > 0)
-        skeleton_uint8 = (skeleton * 255).astype(np.uint8)
-        self.simplified4_skeleton_img = skeleton_uint8
-
-        # 5. Find skeleton contours and simplify with Douglas-Peucker
-        min_length = int(self.pixel_slider['slider'].value() * 2)
-        skeleton_contours, _ = cv2.findContours(self.simplified4_skeleton_img, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
-        simplified_contours = []
-        epsilon_factor = self.simplify_slider['slider'].value() / 100.0  # Use simplify slider
-
-        for cnt in skeleton_contours:
-            if len(cnt) < min_length:
-                continue
-            arc_len = cv2.arcLength(cnt, False)
-            epsilon = epsilon_factor * arc_len
-            simplified = cv2.approxPolyDP(cnt, epsilon, False)
-            if len(simplified) >= 2:
-                simplified_contours.append(simplified)
-
-        # Find the most prominent (longest) contour(s) parallel to mask_outer
-        # Here, we select the largest by arc length
-        N = 5
-        outer_pts = outer_contour.reshape(-1, 2)
-        contour_scores = []
-        for c in simplified_contours:
-            pts = c.reshape(-1, 2)
-            # Mean distance to outer contour
-            dists = [np.min(np.linalg.norm(outer_pts - pt, axis=1)) for pt in pts]
-            mean_dist = np.mean(dists)
-            length = cv2.arcLength(c, False)
-            # Score: prefer long and close to outer contour
-            score = length / (mean_dist + 1e-5)
-            contour_scores.append(score)
-        sorted_indices = np.argsort(contour_scores)[::-1]
-        N = 5  # or any number you want
-        self.simplified4_prominent_contours = [simplified_contours[i] for i in sorted_indices[:N]]
-
-        self.simplified4_fitted_lines = []  # Optionally clear lines
-        self.simplified4_fitted_curves = []
-        self.update_canvas_image()
-    
-    def create_simplified_contour(self):
-        if self.mask is None or np.count_nonzero(self.mask) == 0:
-            return
-
-        # Apply morphological closing/opening with kernel size from slider
-        kernel_size = self.pixel_slider['slider'].value()
-        if kernel_size > 1:
-            kernel = np.ones((kernel_size, kernel_size), np.uint8)
-            mask_for_contours = cv2.morphologyEx(self.mask, cv2.MORPH_CLOSE, kernel)
-        else:
-            mask_for_contours = self.mask.copy()
-
-        if mask_for_contours.max() > 1:
-            mask_for_contours = (mask_for_contours > 0).astype(np.uint8) * 255
-        contours, _ = cv2.findContours(mask_for_contours, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
-        if not contours:
-            return
-
-        largest_contour = max(contours, key=cv2.contourArea)
-        slider_value = 5 # self.simplify_slider['slider'].value()  # 1-100
-        epsilon = (slider_value / 1000.0) * cv2.arcLength(largest_contour, True)  # 0.001–0.1 * arcLength
-        simplified = cv2.approxPolyDP(largest_contour, epsilon, True)
-
-        print(f"Original points: {len(largest_contour)}, Simplified: {len(simplified)}, Epsilon: {epsilon:.4f}, Kernel: {kernel_size}")
-
-        self.decimated_contour = simplified
-
-        contour_img = self.original_image.copy()
-        cv2.drawContours(contour_img, [simplified], -1, (255, 0, 255), 2)
-        self.image = contour_img
-        self.update_canvas_image()        
-
-    def canvas_to_image_coords(self, x, y):
-        """Convert canvas (widget) coordinates to image coordinates, considering pan and zoom."""
-        canvas_w, canvas_h = self.canvas.width(), self.canvas.height()
-        img_h, img_w = self.original_image.shape[:2]
-        scale = self.zoom_level
-        #do not modify this line - intentional logic
-        new_w = int(img_w * scale)
-        new_h = int(img_h * scale)
-        # Do not modify this line — intentional logic
-        # Calculate top-left of image in canvas 
-        img_x0 = (canvas_w - new_w) // 2 + self.pan_x
-        img_y0 = (canvas_h - new_h) // 2 + self.pan_y
-        # Convert canvas to image coordinates
-        img_x = int((x - img_x0) / scale)
-        img_y = int((y - img_y0) / scale)
-        # Clamp to image bounds
-        img_x = np.clip(img_x, 0, img_w - 1)
-        img_y = np.clip(img_y, 0, img_h - 1)
-        return img_x, img_y
-
-    @staticmethod
-    def preprocess_roi_for_ocr(roi):
-        # Convert to grayscale
-        if len(roi.shape) == 3 and roi.shape[2] == 3:
-            roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        else:
-            roi_gray = roi
-
-        # Denoise
-        roi_denoised = cv2.fastNlMeansDenoising(roi_gray, None, h=30, templateWindowSize=7, searchWindowSize=21)
-
-        # Sharpen
-        kernel = np.array([[0, -1, 0], [-1, 5,-1], [0, -1, 0]])
-        roi_sharp = cv2.filter2D(roi_denoised, -1, kernel)
-
-        # Preprocess ROI to connect characters
-        kernel = np.ones((2, 2), np.uint8)
-        roi_closed = cv2.morphologyEx(roi, cv2.MORPH_CLOSE, kernel)
-
-        # Contrast enhancement
-        roi_eq = cv2.equalizeHist(roi_sharp)
-
-        # Threshold (try both adaptive and binary)
-        roi_thresh = roi_eq 
-        # Uncomment below to try adaptive thresholding and comment above line
-        # roi_thresh = cv2.adaptiveThreshold(
-        #     roi_eq, 255,
-        #     cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        #     cv2.THRESH_BINARY,
-        #     11, 2
-        # )
-        # Optionally try: _, roi_thresh = cv2.threshold(roi_eq, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-        # Upscale more aggressively
-        roi_up = cv2.resize(roi_thresh, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
-
-        # Pad horizontally
-        pad = 20
-        roi_up = cv2.copyMakeBorder(roi_up, 0, 0, pad, pad, cv2.BORDER_CONSTANT, value=255)
-
-        # --- Output the preprocessed ROI image ---
-        output_dir = "roi_debug_output"
-        os.makedirs(output_dir, exist_ok=True)
-        filename = f"roi_{int(time.time() * 1000)}.png"
-        output_path = os.path.join(output_dir, filename)
-        cv2.imwrite(output_path, roi_up)
-        print(f"Saved preprocessed ROI to {output_path}")
-
-        return roi_up
-
-    def extract_text_along_decimated_lines(self):
-        if self.image is None or self.decimated_contour is None:
-            return None
-
-        img = self.image.copy()
-        contour = self.decimated_contour
-        line_width = 100
-        results = []
-
-        # Use the largest contour for distance calculation
-        if hasattr(self, 'outer_contour') and self.outer_contour is not None:
-            main_contour = max(self.outer_contour, key=cv2.contourArea)
-        else:
-            main_contour = contour
-
-        max_distance_to_contour = 100  # pixels
-
-        for i in range(len(contour)):
-            pt1 = contour[i][0]
-            pt2 = contour[(i + 1) % len(contour)][0]
-
-            dx = pt2[0] - pt1[0]
-            dy = pt2[1] - pt1[1]
-            length = int(math.hypot(dx, dy))
-            if length < 10:
-                continue
-
-            # Midpoint of the segment
-            mx = int((pt1[0] + pt2[0]) / 2)
-            my = int((pt1[1] + pt2[1]) / 2)
-
-            # Distance from midpoint to contour
-            dist = cv2.pointPolygonTest(main_contour, (mx, my), True)
-            if abs(dist) > max_distance_to_contour:
-                continue  # Skip if farther than 100 pixels
-
-            angle = math.degrees(math.atan2(dy, dx))
-            cx = (pt1[0] + pt2[0]) / 2.0
-            cy = (pt1[1] + pt2[1]) / 2.0
-
-            try:
-                M = cv2.getRotationMatrix2D((cx, cy), angle, 1.0)
-                rotated = cv2.warpAffine(img, M, (img.shape[1], img.shape[0]), flags=cv2.INTER_CUBIC)
-
-                pts = np.array([[pt1], [pt2]], dtype=np.float32)
-                pts_rot = cv2.transform(pts, M)
-                x1r, y1r = pts_rot[0][0]
-                x2r, y2r = pts_rot[1][0]
-
-                x_min = int(min(x1r, x2r))
-                x_max = int(max(x1r, x2r))
-                y_center = int((y1r + y2r) / 2)
-                y_min = max(0, y_center - line_width // 2)
-                y_max = min(rotated.shape[0], y_center + line_width // 2)
-
-                if x_min >= x_max or y_min >= y_max:
-                    continue
-                roi = rotated[y_min:y_max, x_min:x_max]
-                if roi.size == 0 or roi.shape[0] < 5 or roi.shape[1] < 5:
-                    continue
-
-                # --- Preprocess ROI before OCR ---
-                roi_proc = self.preprocess_roi_for_ocr(roi)
-                #comment out above line and use below line to skip preprocessing
-                #roi_proc = roi
-                ocr_text = pytesseract.image_to_string(roi_proc, config="--psm 6").strip()
-
-                roi_inverted = cv2.rotate(roi, cv2.ROTATE_180)
-                #roi_inverted_proc = self.preprocess_roi_for_ocr(roi_inverted)
-                #comment out above line and use below line to skip preprocessing for inverted
-                roi_inverted_proc = roi_inverted
-                ocr_text_inverted = pytesseract.image_to_string(roi_inverted_proc, config="--psm 6").strip()
-                # ----------------------------------
-
-                all_texts = [ocr_text, ocr_text_inverted]
-                number_matches = []
-                for text in all_texts:
-                    number_matches += re.findall(r"\d{1,4}(?:\.\d{1,3})?\s*['\"]?", text)
-                distances = []
-                for match in number_matches:
-                    num_str = re.sub(r"[^\d.]", "", match)
-                    if '.' in num_str:
-                        try:
-                            distances.append(float(num_str))
-                        except ValueError:
-                            continue
-                distance_sum = sum(distances) if distances else 0.0
-                results.append({
-                    "index": i,
-                    "distance_sum_feet": distance_sum,
-                    "pt1": pt1,
-                    "pt2": pt2,
-                    "pixel_length": math.hypot(pt2[0] - pt1[0], pt2[1] - pt1[1])
-                })
-
-            except Exception as e:
-                print(f"Exception on line {i}: {e}")
-                continue
-
-        # Display results in the Qt table_text widget
-        self.table_text.clear()
-        if results:
-            for result in results:
-                self.table_text.append(f"Contour {result['index']}: Distance sum = {result['distance_sum_feet']:.2f}")
-        else:
-            self.table_text.append("No distances found along decimated contour lines.")
-
-        # Append scale factor to the table
-        if self.SCALE_FACTOR is not None:
-            self.table_text.append(f"\nScale Factor: {self.SCALE_FACTOR:.4f} meters/pixel")
-        else:
-            self.table_text.append("\nScale Factor: Not set")
-
-        return results if results else None
-
-    def Distance_find(self, ocr_results):
-        """
-        Sum all distances and update GUI.
-        Returns: total_distance, array of all distances
-        """
-        all_distances = []
-        for r in ocr_results:
-            all_distances.extend(r["distances"])
-        total_distance = sum(all_distances)
-        self.distance_label.setText(f"Measured Distance: {total_distance:.2f}")
-        self.distance_candidates = all_distances
-        return total_distance, all_distances
-    
-    def create_roi_overlay(self, roi_boxes, image_shape):
-        """
-        Draws ROI boxes as overlays for display.
-        roi_boxes: list of np.int32 corner arrays
-        image_shape: shape of the image to overlay on
-        Returns: overlay image
-        """
-        overlay = np.zeros(image_shape, dtype=np.uint8)
-        for box in roi_boxes:
-            cv2.polylines(overlay, [box], isClosed=True, color=(0, 255, 255), thickness=2)
-        return overlay
-
-    def sort_clockwise(self, points):
-        if not points:
-            return []
-
-        # Compute center of all points
-        cx = np.mean([pt[0] for _, pt in points])
-        cy = np.mean([pt[1] for _, pt in points])
-
-        def angle(p):
-            return np.arctan2(p[1] - cy, p[0] - cx)
-
-        return sorted(points, key=lambda x: angle(x[1]))
-  
-    def enable_brown_line_mode(self):
-        self.brown_line_mode = True
-        self.brown_line_points = []
-        self.statusBar().showMessage("Brown line mode: Click two points to add a brown line (snaps to nearest contour).")
-        self.canvas.left_click.disconnect()
-        self.canvas.left_click.connect(self.brown_line_click)
-        self.canvas.mouse_move.connect(self.brown_line_mouse_move)
-
-    def brown_line_click(self, x, y):
-        img_x, img_y = self.canvas_to_image_coords(x, y)
-        snap_x, snap_y = self.snap_to_nearest_contour((img_x, img_y))
-        self.brown_line_points.append((snap_x, snap_y))
-        if len(self.brown_line_points) == 1:
-            # Draw blue snap indicator
-            self.draw_snap_indicator((snap_x, snap_y))
-        elif len(self.brown_line_points) == 2:
-            # Add the brown line
-            self.brown_lines.append(tuple(self.brown_line_points))
-            self.brown_line_mode = False
-            self.statusBar().showMessage("Brown line added.")
-            self.brown_line_points = []
-            self.update_canvas_image()
-            # Restore normal left click
-            self.set_default_left_click()
-            self.canvas.mouse_move.disconnect(self.brown_line_mouse_move)
-
-    def brown_line_mouse_move(self, x, y):
-        if not self.brown_line_mode or len(self.brown_line_points) >= 2:
-            return
-        img_x, img_y = self.canvas_to_image_coords(x, y)
-        snap_x, snap_y = self.snap_to_nearest_contour((img_x, img_y))
-        self.draw_snap_indicator((snap_x, snap_y))
-
-    def snap_to_nearest_contour(self, pt):
-        # Snap to nearest point on any contour (decimated_contour)
-        if self.decimated_contour is None:
-            return pt
-        contour = self.decimated_contour.reshape(-1, 2)
-        dists = np.linalg.norm(contour - np.array(pt), axis=1)
-        idx = np.argmin(dists)
-        return tuple(contour[idx])
-
-    def draw_snap_indicator(self, pt):
-        # Draw a blue circle at pt on the canvas, with larger radius and thinner outline
-        self.update_canvas_image()  # Redraw base image and lines
-        pixmap = self.canvas.pixmap().copy()
-        from PyQt5.QtGui import QPainter, QPen
-        from PyQt5.QtCore import QPoint
-        qp = QPainter(pixmap)
-        pen = QPen(QColor("blue"))
-        pen.setWidth(4)  # Thinner outline
-        qp.setPen(pen)
-        canvas_x, canvas_y = self.image_to_canvas_coords(pt[0], pt[1])
-        qp.drawEllipse(QPoint(canvas_x, canvas_y), 12, 12)  # Larger radius
-        qp.end()
-        self.canvas.setPixmap(pixmap)
-            # Optionally highlight the nearest segment
-        if self.decimated_contour is not None:
-            contour = self.decimated_contour.reshape(-1, 2)
-            dists = np.linalg.norm(contour - np.array(pt), axis=1)
-            idx = np.argmin(dists)
-            pt1 = contour[idx]
-            pt2 = contour[(idx + 1) % len(contour)]
-            pen_line = QPen(QColor("blue"))
-            pen_line.setWidth(2)
-            qp.setPen(pen_line)
-            x1, y1 = self.image_to_canvas_coords(pt1[0], pt1[1])
-            x2, y2 = self.image_to_canvas_coords(pt2[0], pt2[1])
-            qp.drawLine(x1, y1, x2, y2)
-
-    def image_to_canvas_coords(self, img_x, img_y):
-        # Inverse of canvas_to_image_coords
-        canvas_w, canvas_h = self.canvas.width(), self.canvas.height()
-        img_h, img_w = self.original_image.shape[:2]
-        scale = self.zoom_level
-        new_w = int(img_w * scale)
-        new_h = int(img_h * scale)
-        img_x0 = (canvas_w - new_w) // 2 + self.pan_x
-        img_y0 = (canvas_h - new_h) // 2 + self.pan_y
-        canvas_x = int(img_x * scale + img_x0)
-        canvas_y = int(img_y * scale + img_y0)
-        return canvas_x, canvas_y
-
-    def robust_scale_factor(self, pixel_lengths, real_distances_meters):
-        """
-        Robustly calculate scale factor (meters per pixel) using least squares and outlier rejection.
-        Returns: scale_factor, pixel_scale, inlier_mask
-        """
-        import numpy as np
-        pixel_lengths = np.array(pixel_lengths)
-        real_distances_meters = np.array(real_distances_meters)
-        if len(pixel_lengths) < 2 or len(real_distances_meters) < 2:
-            return None, None, None
-
-        # Linear fit: real_distance = scale_factor * pixel_length
-        A = np.vstack([pixel_lengths, np.ones(len(pixel_lengths))]).T
-        result = np.linalg.lstsq(A, real_distances_meters, rcond=None)
-        scale_factor, intercept = result[0]
-
-        # Calculate residuals
-        predicted = scale_factor * pixel_lengths + intercept
-        residuals = real_distances_meters - predicted
-        std_res = np.std(residuals)
-
-        # Identify inliers (within 2 standard deviations)
-        inlier_mask = np.abs(residuals) < 2 * std_res
-
-        # Refit using only inliers
-        if np.sum(inlier_mask) >= 2:
-            A_in = np.vstack([pixel_lengths[inlier_mask], np.ones(np.sum(inlier_mask))]).T
-            result_in = np.linalg.lstsq(A_in, real_distances_meters[inlier_mask], rcond=None)
-            scale_factor, intercept = result_in[0]
-            pixel_scale = 1.0 / scale_factor if scale_factor != 0 else None
-        else:
-            pixel_scale = None
-
-        return scale_factor, pixel_scale, inlier_mask
-
-    def on_aggressiveness_slider_changed(self):
-        # Restart the timer every time the slider value changes
-        self.aggressiveness_timer.start(200)
-
-    def on_contrast_slider_changed(self):
-        self.contrast_timer.start(200)
-
-    def on_pixel_slider_changed(self):
-        self.kernel_timer.start(200)
-
-    def on_simplify_slider_changed(self):
-        self.simplify_timer.start(200)
-
-    def find_best_contrast_for_ocr(self, roi=None, contrast_range=None):
-        """
-        Try different contrast settings and pick the one that gives the best OCR result.
-        roi: region of interest (numpy array). If None, use the whole original image.
-        contrast_range: list or range of contrast values to try (default: 60 to 180).
-        Returns: best_contrast, best_text, best_score
-        """
-        if roi is None:
-            roi = self.original_image
-        if contrast_range is None:
-            contrast_range = range(60, 181, 10)  # Try values from 60 to 180
-
-        best_score = -1
-        best_contrast = None
-        best_text = ""
-        for contrast in contrast_range:
-            alpha = contrast / 100.0
-            enhanced = cv2.convertScaleAbs(roi, alpha=alpha, beta=0)
-            # Preprocess for OCR if needed
-            gray = cv2.cvtColor(enhanced, cv2.COLOR_BGR2GRAY) if len(enhanced.shape) == 3 else enhanced
-            text = pytesseract.image_to_string(gray, config="--psm 6")
-            # Score: count number of digits found (or use another metric)
-            score = len(re.findall(r"\d", text))
-            if score > best_score:
-                best_score = score
-                best_contrast = contrast
-                best_text = text
-        return best_contrast, best_text, best_score
-
-    def auto_contrast_for_ocr(self):
-        best_contrast, best_text, best_score = self.find_best_contrast_for_ocr()
-        if best_contrast is not None:
-            self.contrast_slider['slider'].setValue(best_contrast)
-            self.statusBar().showMessage(f"Best contrast for OCR: {best_contrast} (score: {best_score})")
-            print("Best OCR text sample:", best_text)
-        else:
-            self.statusBar().showMessage("Auto contrast failed to find a better setting.")
-
-    def enable_auto_contrast_roi_mode(self):
-        self.statusBar().showMessage("Click near a contour segment to select ROI for auto contrast.")
-        try:
-            self.canvas.left_click.disconnect(self.add_seed_point)
-        except Exception:
-            pass
-        self.canvas.left_click.connect(self.auto_contrast_roi_pick)
-
-    def paintEvent(self, event):
-        super().paintEvent(event)
-        if getattr(self, 'roi_selecting', False) and hasattr(self, 'roi_start') and hasattr(self, 'roi_end'):
-            painter = QPainter(self)
-            pen = QPen(QColor(255, 255, 0, 128))  # Semi-transparent yellow
-            pen.setWidth(2)
-            painter.setPen(pen)
-            x1, y1 = self.roi_start
-            x2, y2 = self.roi_end
-            painter.drawRect(min(x1, x2), min(y1, y2), abs(x2 - x1), abs(y2 - y1))
-            painter.end()
-
-    def auto_contrast_roi_pick(self, x, y):
-        img_x, img_y = self.canvas_to_image_coords(x, y)
-        if self.decimated_contour is None:
-            self.statusBar().showMessage("No contour available.")
-            return
-
-        contour = self.decimated_contour.reshape(-1, 2)
-        # Find nearest segment
-        min_dist = float('inf')
-        nearest_idx = 0
-        for i in range(len(contour)):
-            pt1 = contour[i]
-            pt2 = contour[(i + 1) % len(contour)]
-            v = np.array(pt2) - np.array(pt1)
-            w = np.array([img_x, img_y]) - np.array(pt1)
-            if np.dot(v, v) == 0:
-                proj = pt1
-            else:
-                t = np.clip(np.dot(w, v) / np.dot(v, v), 0, 1)
-                proj = pt1 + t * v
-            dist = np.linalg.norm(np.array([img_x, img_y]) - proj)
-            if dist < min_dist:
-                min_dist = dist
-                nearest_idx = i
-
-        pt1 = contour[nearest_idx]
-        pt2 = contour[(nearest_idx + 1) % len(contour)]
-        seg_vec = np.array(pt2) - np.array(pt1)
-        seg_len = np.linalg.norm(seg_vec)
-        if seg_len < 1:
-            self.statusBar().showMessage("Contour segment too short.")
-            return
-        seg_dir = seg_vec / seg_len
-        perp_dir = np.array([-seg_dir[1], seg_dir[0]])
-        center = (np.array(pt1) + np.array(pt2)) / 2
-        half_width = 50
-        p1 = center - seg_vec / 2 + perp_dir * half_width
-        p2 = center + seg_vec / 2 + perp_dir * half_width
-        p3 = center + seg_vec / 2 - perp_dir * half_width
-        p4 = center - seg_vec / 2 - perp_dir * half_width
-        roi_corners = np.array([p1, p2, p3, p4], dtype=np.float32)
-        dst_rect = np.array([
-            [0, 0],
-            [int(seg_len), 0],
-            [int(seg_len), 100],
-            [0, 100]
-        ], dtype=np.float32)
-        M = cv2.getPerspectiveTransform(roi_corners, dst_rect)
-        roi = cv2.warpPerspective(self.original_image, M, (int(seg_len), 100))
-
-        best_contrast, best_text, best_score = self.find_best_contrast_for_ocr(roi)
-        if best_contrast is not None:
-            self.contrast_slider['slider'].setValue(best_contrast)
-            self.statusBar().showMessage(f"Best contrast for OCR (ROI): {best_contrast} (score: {best_score})")
-            print("Best OCR text sample (ROI):", best_text)
-        else:
-            self.statusBar().showMessage("Auto contrast failed to find a better setting for ROI.")
-
-        # Draw ROI for feedback
-        overlay = self.image.copy() if self.image is not None else self.original_image.copy()
-        roi_poly = roi_corners.astype(np.int32).reshape((-1, 1, 2))
-        cv2.polylines(overlay, [roi_poly], isClosed=True, color=(0, 255, 255), thickness=2)
-        self.image = overlay
-        self.update_canvas_image()
-
-        # Restore normal left click
-        self.set_default_left_click()
-    
-    def on_extract_distances_clicked(self):
-        self.last_contour_distances = self.extract_text_along_decimated_lines()
-    
-    def set_default_left_click(self):
-        try:
-            self.canvas.left_click.disconnect(self.auto_contrast_roi_pick)
-        except Exception:
-            pass
-        try:
-            self.canvas.left_click.disconnect(self.brown_line_click)
-        except Exception:
-            pass
-        try:
-            self.canvas.left_click.disconnect(self.add_seed_point)
-        except Exception:
-            pass
-        self.canvas.left_click.connect(self.add_seed_point)
-
-    def on_brightness_slider_changed(self):
-        self.update_canvas_image()
-    
-    def reset_all_sliders(self):
-        # Reset all sliders to their default values
-        self.aggressiveness_slider['slider'].setValue(25)
-        self.pixel_slider['slider'].setValue(2)
-        self.contrast_slider['slider'].setValue(100)
-        # self.kernel_slider['slider'].setValue(5)
-        # self.lambda_slider['slider'].setValue(0)
-        self.simplify_slider['slider'].setValue(5)
-        self.brightness_slider['slider'].setValue(0)
-
-        # Also update the displayed values
-        self.aggressiveness_slider['value_label'].setText("25")
-        self.pixel_slider['value_label'].setText("2")
-        self.contrast_slider['value_label'].setText("100")
-        # self.kernel_slider['value_label'].setText("5")
-        # self.lambda_slider['value_label'].setText("0")
-        self.simplify_slider['value_label'].setText("5")
-        self.brightness_slider['value_label'].setText("0")
-
-                # Reset other relevant states if necessary
-        self.mask = None
-        self.seed_points = []
-        self.image = self.original_image.copy() if self.original_image is not None else None
-
-        self.update_canvas_image()
-
-    @staticmethod
-    def apply_contrast_brightness_preserve_white(img, alpha, beta):
-        img = img.astype(np.float32)
-        # Save mask of white pixels
-        white_mask = np.all(img == 255, axis=2) if img.ndim == 3 else (img == 255)
-        # Apply contrast and brightness
-        img = img * alpha + beta
-        # Restore white pixels
-        if img.ndim == 3:
-            img[white_mask] = 255
-        else:
-            img[white_mask] = 255
-        # Clip to [0, 255] and convert back to uint8
-        img = np.clip(img, 0, 255).astype(np.uint8)
-        return img
-   
-    def create_simplified_contour_4(self):
-        if self.mask is None or np.count_nonzero(self.mask) == 0:
-            return
-
-        # 1. Offset outer contour by 4*pixel_slider
-        mask_orig = (self.mask > 0).astype(np.uint8) * 255
-        contours, _ = cv2.findContours(mask_orig, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            return
-        outer_contour = max(contours, key=cv2.contourArea)
-        offset_amt = max(1, int(self.pixel_slider['slider'].value() * 4))
-        kernel = np.ones((offset_amt, offset_amt), np.uint8)
-        mask_outer_offset = cv2.dilate(mask_orig, kernel, iterations=1)
-        contours_offset, _ = cv2.findContours(mask_outer_offset, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours_offset:
-            return
-        outer_offset_contour = max(contours_offset, key=cv2.contourArea)
-                # --- Find concave regions of the outer contour ---
-        hull = cv2.convexHull(outer_contour, returnPoints=False)
-        defects = cv2.convexityDefects(outer_contour, hull)
-        self.concave_points = []
-        if defects is not None:
-            for i in range(defects.shape[0]):
-                s, e, f, d = defects[i, 0]
-                far = tuple(outer_contour[f][0])
-                # You can filter by depth (d) if you want only "deep" concavities
-                if d > 1000:  # Tune this threshold as needed
-                    self.concave_points.append(far)
-        
-        # for complexity metric
-        arc_len_outer = cv2.arcLength(outer_contour, True)
-        num_points_outer = len(outer_contour)
-        complexity = arc_len_outer / (num_points_outer + 1e-5)  # Avoid division by zero
-
-
-        # 2. Create between_image: mask inside by inner mask, outside by outer mask
-        between_image = self.original_image.copy()
-        mask_inner = np.zeros_like(mask_orig)
-        cv2.drawContours(mask_inner, [outer_contour], -1, 255, thickness=cv2.FILLED)
-        between_image[mask_inner > 0] = 255
-        mask_outer = np.zeros_like(mask_orig)
-        cv2.drawContours(mask_outer, [outer_offset_contour], -1, 255, thickness=cv2.FILLED)
-        mask_outside = cv2.bitwise_not(mask_outer)
-        between_image[mask_outside > 0] = 255
-
-        # 3. Invert between_image
-        between_image_inv = cv2.bitwise_not(cv2.cvtColor(between_image, cv2.COLOR_BGR2GRAY))
-
-        # 4. Skeletonize
-        skeleton = skeletonize(between_image_inv > 0)
-        skeleton_uint8 = (skeleton * 255).astype(np.uint8)
-        self.simplified4_skeleton_img = skeleton_uint8
-
-        # 5. Find skeleton contours and simplify with Douglas-Peucker
-        min_length = int(self.pixel_slider['slider'].value() * 2)
-        skeleton_contours, _ = cv2.findContours(self.simplified4_skeleton_img, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
-        simplified_contours = []
-        base_epsilon_factor = self.simplify_slider['slider'].value() / 1000.0
-        # Inverse scaling: more complex = smaller epsilon
-        epsilon_factor = base_epsilon_factor / (complexity + 1e-5)  # Avoid division by zero
-
-        for cnt in skeleton_contours:
-            if len(cnt) < min_length:
-                continue
-            arc_len = cv2.arcLength(cnt, False)
-            epsilon = epsilon_factor * arc_len
-            simplified = cv2.approxPolyDP(cnt, epsilon, False)
-            if len(simplified) >= 2:
-                simplified_contours.append(simplified)
-
-        # Find the most prominent (longest) contour(s) parallel to mask_outer
-        # Here, we select the largest by arc length
-        N = self.simplify_slider['slider'].value()
-        outer_pts = outer_contour.reshape(-1, 2)
-        contour_scores = []
-        for c in simplified_contours:
-            pts = c.reshape(-1, 2)
-            # Mean distance to outer contour
-            dists = [np.min(np.linalg.norm(outer_pts - pt, axis=1)) for pt in pts]
-            mean_dist = np.mean(dists)
-            length = cv2.arcLength(c, False)
-            # Score: prefer long and close to outer contour
-            score = length / (mean_dist + 1e-5)
-            contour_scores.append(score)
-        top_indices = np.argsort(contour_scores)[::-1][:N]
-        self.simplified4_prominent_contours = [simplified_contours[i] for i in top_indices]
-
-        self.simplified4_fitted_lines = []  # Optionally clear lines
-        self.simplified4_fitted_curves = []
-        self.update_canvas_image()
+        self.export_display_image("DisplayOuterContour_v5.png") 
     
     # def create_simplified_contour(self):
     #     if self.mask is None or np.count_nonzero(self.mask) == 0:
@@ -3864,12 +1790,236 @@ class FloodFillApp(QMainWindow):
     #     contour_img = self.original_image.copy()
     #     cv2.drawContours(contour_img, [simplified], -1, (255, 0, 255), 2)
     #     self.image = contour_img
-    #     self.update_canvas_image()
+    #     self.update_canvas_image()        
+
+    def export_display_image(self, filename="DisplayOuterContour.png"):
+        # Recreate the display image as in update_canvas_image, but do not resize or convert to QPixmap
+        contrast_value = self.contrast_slider['slider'].value()
+        alpha = contrast_value / 100.0
+        brightness_value = self.brightness_slider['slider'].value()
+        beta = brightness_value
+        flood_img = cv2.convertScaleAbs(self.original_image, alpha=alpha, beta=beta)
+
+        if self.mask is not None and np.count_nonzero(self.mask) > 0:
+            mask_overlay = flood_img.copy()
+            mask_overlay[self.mask > 0] = [0, 0, 255]
+            flood_img = cv2.addWeighted(flood_img, 0.7, mask_overlay, 0.3, 0)
+            if self.decimated_contour is None:
+                mask_for_contours = (self.mask > 0).astype(np.uint8) * 255
+                contours, _ = cv2.findContours(mask_for_contours, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                cv2.drawContours(flood_img, contours, -1, (0, 255, 0), 2)
+
+        if self.decimated_contour is not None:
+            cv2.drawContours(flood_img, [self.decimated_contour], -1, (255, 0, 255), 2)
+
+        if hasattr(self, 'simplified4_offset_contour') and self.simplified4_offset_contour is not None:
+            cv2.drawContours(flood_img, [self.simplified4_offset_contour], -1, (0, 255, 0), 2)
+
+        # Add any other overlays as needed...
+
+        # Save as PNG
+        cv2.imwrite(filename, cv2.cvtColor(flood_img, cv2.COLOR_RGB2BGR))
+        print(f"Display image exported to {filename}")
+
+    def simplify_contour_midpoint_intersection(self, contour, abutting_contours, simplify_value):
+        simplified_points = []
+        contour_pts = contour.reshape(-1, 2)
+        step = max(1, int(simplify_value / 100))  # Adjust divisor for desired effect
+        for i in range(0, len(contour_pts), step):
+            pt1 = contour_pts[i]
+            pt2 = contour_pts[(i + 1) % len(contour_pts)]
+            midpoint = ((pt1[0] + pt2[0]) // 2, (pt1[1] + pt2[1]) // 2)
+            direction = np.array([pt2[1] - pt1[1], pt1[0] - pt2[0]])
+            direction = direction / (np.linalg.norm(direction) + 1e-8)
+            found_intersection = False
+            for d in np.linspace(-50, 50, 100):
+                test_pt = (int(midpoint[0] + d * direction[0]), int(midpoint[1] + d * direction[1]))
+                for abut in abutting_contours:
+                    abut_pts = abut.reshape(-1, 2)
+                    if cv2.pointPolygonTest(abut_pts, test_pt, False) >= 0:
+                        simplified_points.append(test_pt)
+                        found_intersection = True
+                        break
+                if found_intersection:
+                    break
+            if not found_intersection:
+                simplified_points.append(midpoint)
+        # --- Filter out small deviations ---
+        filtered_points = []
+        deviation_threshold = max(3, int(self.pixel_slider['slider'].value()))  # Use pixel_slider as threshold
+        for i, pt in enumerate(simplified_points):
+            if i == 0 or i == len(simplified_points) - 1:
+                filtered_points.append(pt)
+            else:
+                prev_pt = np.array(filtered_points[-1])
+                next_pt = np.array(simplified_points[(i + 1) % len(simplified_points)])
+                curr_pt = np.array(pt)
+                # Compute deviation from line between prev_pt and next_pt
+                line_vec = next_pt - prev_pt
+                if np.linalg.norm(line_vec) == 0:
+                    filtered_points.append(pt)
+                    continue
+                proj = prev_pt + np.dot(curr_pt - prev_pt, line_vec) / np.dot(line_vec, line_vec) * line_vec
+                deviation = np.linalg.norm(curr_pt - proj)
+                if deviation > deviation_threshold:
+                    filtered_points.append(pt)
+                # else: skip this point
+
+        simplified_contour = np.array(filtered_points, dtype=np.int32).reshape(-1, 1, 2)
+        return simplified_contour
+
+    def create_simplified_contour_midpoint(self):
+        mask_for_contours = (self.mask > 0).astype(np.uint8) * 255
+        contours, _ = cv2.findContours(mask_for_contours, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return
+        outer_contour = max(contours, key=cv2.contourArea)
+        abutting_contours = [c for c in contours if not np.array_equal(c, outer_contour)]
+        simplified = self.simplify_contour_midpoint_intersection(outer_contour, abutting_contours)
+        self.decimated_contour = simplified
+        self.update_canvas_image()
+
+    def fit_best_lines_to_skeleton(self):
+        """
+        Fit best lines to the skeleton image using cumulative segment length.
+        Only fit lines to segments whose cumulative length >= min_cumulative_length.
+        """
+        if not hasattr(self, 'simplified4_skeleton_img') or self.simplified4_skeleton_img is None:
+            return
+
+        skeleton_img = self.simplified4_skeleton_img
+        min_cumulative_length = int(self.pixel_slider['slider'].value())  # or any threshold you want
+        max_segment_length = 1000  # Optional: limit segment size
+
+        contours, _ = cv2.findContours(skeleton_img, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+        fitted_lines = []
+
+        for cnt in contours:
+            pts = cnt.reshape(-1, 2)
+            i = 0
+            while i < len(pts) - 1:
+                segment = [pts[i]]
+                cum_length = 0
+                j = i + 1
+                # Accumulate points until cumulative length meets threshold or max_segment_length
+                while j < len(pts):
+                    prev = segment[-1]
+                    curr = pts[j]
+                    step_length = math.hypot(curr[0] - prev[0], curr[1] - prev[1])
+                    cum_length += step_length
+                    segment.append(curr)
+                    if cum_length >= min_cumulative_length or len(segment) >= max_segment_length:
+                        break
+                    j += 1
+                if cum_length >= min_cumulative_length and len(segment) >= 2:
+                    segment_np = np.array(segment)
+                    [vx, vy, x0, y0] = cv2.fitLine(segment_np, cv2.DIST_L2, 0, 0.01, 0.01)
+                    t0 = -cum_length // 2
+                    t1 = cum_length // 2
+                    pt1 = (int(x0 + vx * t0), int(y0 + vy * t0))
+                    pt2 = (int(x0 + vx * t1), int(y0 + vy * t1))
+                    fitted_lines.append((pt1, pt2))
+                    i = j  # Move window forward
+                else:
+                    i += 1  # Not enough length, move forward by one
+
+        self.simplified4_fitted_lines = fitted_lines
+        self.group_and_best_fit_offset_midpoints()
+        self.update_canvas_image()
+
+    def group_and_best_fit_offset_midpoints(self):
+        """
+        Group midpoints of simplified4_fitted_lines by slope (within 2 degrees) and proximity (within 500 pixels),
+        then best-fit a line to each group and store for display.
+        """
+        if not hasattr(self, 'simplified4_fitted_lines') or not self.simplified4_fitted_lines:
+            self.simplified4_offset_bestfit_groups = []
+            return
+
+        # Compute midpoints for each fitted line
+        midpoints = []
+        for pt1, pt2 in self.simplified4_fitted_lines:
+            mx = (pt1[0] + pt2[0]) // 2
+            my = (pt1[1] + pt2[1]) // 2
+            midpoints.append((mx, my))
+
+        # Group lines by slope and proximity
+        lines = self.simplified4_fitted_lines
+        groups = []
+
+        def line_angle(pt1, pt2):
+            dx = pt2[0] - pt1[0]
+            dy = pt2[1] - pt1[1]
+            return math.degrees(math.atan2(dy, dx))
+
+        def lines_close(l1, l2, max_dist=500):
+            return (np.linalg.norm(np.array(l1[0]) - np.array(l2[0])) < max_dist or
+                    np.linalg.norm(np.array(l1[1]) - np.array(l2[1])) < max_dist or
+                    np.linalg.norm(np.array(l1[0]) - np.array(l2[1])) < max_dist or
+                    np.linalg.norm(np.array(l1[1]) - np.array(l2[0])) < max_dist)
+
+        used = set()
+        for i, (pt1, pt2) in enumerate(lines):
+            if i in used:
+                continue
+            angle1 = line_angle(pt1, pt2)
+            group = [i]
+            used.add(i)
+            for j, (pt3, pt4) in enumerate(lines):
+                if j == i or j in used:
+                    continue
+                angle2 = line_angle(pt3, pt4)
+                if abs(angle1 - angle2) <= 2 and lines_close((pt1, pt2), (pt3, pt4)):
+                    group.append(j)
+                    used.add(j)
+            groups.append(group)
+
+        # Best-fit each group using their midpoints
+        bestfit_lines = []
+        for group in groups:
+            group_midpoints = [midpoints[idx] for idx in group]
+            pts_np = np.array(group_midpoints, dtype=np.int32)
+            if len(pts_np) < 2:
+                continue
+            [vx, vy, x0, y0] = cv2.fitLine(pts_np, cv2.DIST_L2, 0, 0.01, 0.01)
+            vx, vy, x0, y0 = float(vx), float(vy), float(x0), float(y0)
+            proj = np.dot(pts_np - np.array([x0, y0]), np.array([vx, vy]))
+            t0, t1 = proj.min(), proj.max()
+            pt_start = (int(x0 + vx * t0), int(y0 + vy * t0))
+            pt_end = (int(x0 + vx * t1), int(y0 + vy * t1))
+            bestfit_lines.append((pt_start, pt_end))
+
+        self.simplified4_offset_bestfit_groups = bestfit_lines
 
 
+    def expand_fill_area_until_perimeter(self, mask, initial_gap, min_gap, perimeter_threshold=1.05):
+        """
+        Iteratively reduce Remove_inner_island_by_Gap (kernel size) and expand mask
+        until the perimeter increases by more than 10%.
+        Returns: mask and contour for Remove_inner_island_by_Gap = 1
+        """
+        gap = initial_gap
+        mask_gap1 = None
+        contour_gap1 = None
 
+        while gap >= min_gap:
+            kernel = np.ones((int(gap), int(gap)), np.uint8)
+            expanded_mask = cv2.dilate(mask, kernel, iterations=1)
+            contours, _ = cv2.findContours((expanded_mask > 0).astype(np.uint8) * 255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not contours:
+                break
+            outer_contour = max(contours, key=cv2.contourArea)
+            perimeter = cv2.arcLength(outer_contour, True)
 
+            # Save mask and contour for gap == 1
+            if gap == 1:
+                mask_gap1 = expanded_mask
+                contour_gap1 = outer_contour
 
+            gap -= 1  # Reduce gap
+
+        # Return mask and contour for Remove_inner_island_by_Gap = 1
+        return mask_gap1, 1, contour_gap1
 
 
 if __name__ == "__main__":

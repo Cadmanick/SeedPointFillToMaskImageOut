@@ -87,6 +87,17 @@ class ImageViewer(QGraphicsView):
                         m = re.search(r'[0-9]', selected)
                         if m:
                             selected = selected[m.start():]
+                    # Remove periods from bearings
+                    if selected and selected[0] in 'NWSE' and '.' in selected:
+                        selected = selected.replace('.', '')
+                    # --- Replace S with 5 if S is not first or last character and text is a bearing ---
+                    if selected and (selected[0] in 'NWSE' or selected[-1] in 'NWSE'):
+                        if len(selected) > 2:
+                            chars = list(selected)
+                            for i in range(1, len(chars)-1):
+                                if chars[i] == 'S':
+                                    chars[i] = '5'
+                            selected = ''.join(chars)
                     print(f"Selected text: {selected}")
                     return
         if event.button() == Qt.MiddleButton:
@@ -429,6 +440,10 @@ class MainWindow(QMainWindow):
                 text = text.replace('-', '')
                 if text.endswith('.'):
                     text = text[:-1]
+                # --- Strip periods from bearings ---
+                # Bearings pattern: starts with N/S/E/W, may have digits and periods, ends with N/S/E/W
+                if re.match(r'^[NSEW][0-9\.]+[NSEW]$', text):
+                    text = text.replace('.', '')
                 if text.strip():
                     x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
                     x_exp = max(0, x - expand)

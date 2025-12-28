@@ -168,6 +168,11 @@ class FloodFillApp(QMainWindow):
         self.export_geotiff_button.clicked.connect(self.export_geotiff)
         button_layout.addWidget(self.export_geotiff_button)
 
+        # NEW: kernel sweep test button
+        self.kernel_sweep_button = QPushButton("Test Kernel Sweep")
+        self.kernel_sweep_button.clicked.connect(self.test_kernel_sweep_for_best_fill)
+        button_layout.addWidget(self.kernel_sweep_button)
+
         self.add_brown_line_button = QPushButton("Add Brown Line")
         self.add_brown_line_button.clicked.connect(self.enable_brown_line_mode)
         button_layout.addWidget(self.add_brown_line_button)
@@ -297,7 +302,7 @@ class FloodFillApp(QMainWindow):
         self.seed_points.append((img_x, img_y))  # Append instead of replace
         print("Mask nonzero count:", np.count_nonzero(self.mask))
         print("Seed points:", self.seed_points)
-        self.flood_fill_and_show_mask_contours()
+        self.flood_fill_and_show_mask_contours_modular()
 
     def trace_line(self, x, y):
         """Handle right-click to measure distance between two points and display in distance_label."""
@@ -357,28 +362,44 @@ class FloodFillApp(QMainWindow):
         # Port your logic from Tkinter's reset_mouse_pos here
         pass
 
+    def choose_gap_kernel_descending(self, start_k: int, perimeter_jump_ratio: float = 1.30, min_k: int = 1):
+        """
+        Descend kernel size from start_k down to min_k.
+        Return the last kernel size before perimeter jumps by > perimeter_jump_ratio.
+        If no jump occurs, returns min_k (or last valid).
+        """
+        start_k = max(min_k, int(start_k))
+        last_peri = None
+        last_good_k = start_k
+
+        for k in range(start_k, min_k - 1, -1):
+            mask_k, ctr_k = self._compute_flood_mask_with_gap(k)
+            if mask_k is None or ctr_k is None:
+                # If we already have a valid previous kernel, stop; else continue searching.
+                if last_peri is not None:
+                    break
+                else:
+                    continue
+
+            _, peri_k = self._contour_area_perimeter(ctr_k)
+
+            if last_peri is not None and peri_k > last_peri * perimeter_jump_ratio:
+                # Leak detected; stop and use last_good_k
+                break
+
+            last_good_k = k
+            last_peri = peri_k
+
+            if k == min_k:
+                break
+
+        return last_good_k
+
     def flood_fill_and_show_mask_contours_modular(self):
         """
-        Bridging-oriented flood fill:
-
-        Modules overview:
-        0) Guard & seed selection        - Validate state and pick the last seed for deterministic updates.
-        1) Source selection               - Choose a stable image (original) to avoid drift from contrast/brightness.
-        2) FloodFill mask w/ border       - Allocate OpenCV flood-fill mask and mark its required 1px border.
-        3) Gap preprocessing (erosion)    - Light erosion to help close tiny gaps before flood fill.
-        4) Barriers (brown lines)         - Draw user-added brown lines into the mask as barriers to flood.
-        5) Flood fill from seed           - Run flood fill to produce a candidate new region (0/1).
-        6) Integrate with existing mask   - Combine the new region while limiting outward growth:
-           6a) Connected components       - Find the component under the seed (if any).
-           6b) New component path         - If seed in empty area, add the whole region (no expansion control).
-           6c) Bridging path              - If seed inside an existing component:
-                - Limit expansion by geodesic dilation from that component (radius-controlled).
-                - Only allow pixels near other components (bridge intent), plus direct contact.
-           6d) Age map update             - Track per-pixel "age" of mask for overlay coloring.
-        7) Local cleanup (closing)        - Small closing to remove seams; clamp to envelope to avoid bulging.
-        8) Overlay rendering              - Newest pixels bright red; older pixels progressively darker red.
-        9) Debug save (optional)          - Save latest blended image to disk (overwrites).
-        10) UI update                     - Push new image to canvas.
+        Bridging-oriented flood fill with automatic descending kernel sweep and
+        adaptive dilation selection to 'Maximize Flood Area Around Non Boundary Lines'.
+        (Sweep does NOT adjust the Gap Pixels slider; it is used only for this call.)
         """
         # === 0) Guard & seed selection ===
         if self.image is None or not self.seed_points:
@@ -386,81 +407,220 @@ class FloodFillApp(QMainWindow):
             return
         sx, sy = self.seed_points[-1]
 
-        # === 1) Source selection (stable base to avoid growth drift) ===
+        # === Kernel sweep (local, non-destructive to slider) ===
+        user_gap = max(1, self.pixel_slider['slider'].value())
+        # gap_px = self.choose_gap_kernel_descending(user_gap, perimeter_jump_ratio=1.20, min_k=1)
+        # if gap_px != user_gap:
+        #     print(f"[Kernel Sweep] Using gap {gap_px} (slider remains {user_gap})")
+        # uncomment above lines to enable kernel sweep selection
+        gap_px = user_gap
+
+        # === 1) Source selection ===
         flood_source = self.original_image
 
-        # === 2) FloodFill mask w/ border (OpenCV requirement) ===
+        # === 2) FloodFill mask w/ border ===
         h, w = flood_source.shape[:2]
-        ff_mask = np.zeros((h + 2, w + 2), np.uint8)
-        ff_mask[0, :] = 1; ff_mask[-1, :] = 1
-        ff_mask[:, 0] = 1; ff_mask[:, -1] = 1
+        base_ff_mask = np.zeros((h + 2, w + 2), np.uint8)
+        base_ff_mask[0, :] = 1; base_ff_mask[-1, :] = 1
+        base_ff_mask[:, 0] = 1; base_ff_mask[:, -1] = 1
 
-        # === 3) Gap preprocessing (erosion) ===
-        gap_px = max(1, self.pixel_slider['slider'].value())
+        # === 3) Gap preprocessing (erosion) using swept gap_px ===
         if gap_px > 1:
             kernel_gap = np.ones((gap_px, gap_px), np.uint8)
             prep_img = cv2.erode(flood_source, kernel_gap)
         else:
             prep_img = flood_source
 
-        # === 4) Barriers (brown lines drawn into ff_mask) ===
+        # === 4) Barriers (brown lines) ===
         if self.brown_lines:
             for pt1, pt2 in self.brown_lines:
                 p1 = (int(pt1[0]) + 1, int(pt1[1]) + 1)
                 p2 = (int(pt2[0]) + 1, int(pt2[1]) + 1)
-                cv2.line(ff_mask, p1, p2, color=1, thickness=5)
+                cv2.line(base_ff_mask, p1, p2, color=1, thickness=5)
 
-        # === 5) Flood fill from seed to produce candidate region ===
-        aggressiveness = self.aggressiveness_slider['slider'].value()
-        cv2.floodFill(
-            prep_img, ff_mask, (int(sx), int(sy)), (255, 255, 255),
-            (aggressiveness,)*3, (aggressiveness,)*3,
-            flags=cv2.FLOODFILL_MASK_ONLY | cv2.FLOODFILL_FIXED_RANGE
-        )
-        new_region = ff_mask[1:-1, 1:-1]  # 0/1
-        if np.count_nonzero(new_region) == 0:
-            print("Flood produced no region.")
+        # === Helper: single flood with dilation k on a provided source image ===
+        def _flood_with_dilation(dilate_k: int, src_img: np.ndarray):
+            """
+            Perform a flood fill using a dilation (k) applied to src_img.
+            src_img: starting image (already eroded / preprocessed as desired).
+            dilate_k: dilation kernel size (>=1). If 1, no dilation applied.
+            Returns: (mask_u8, area_pixels)
+            """
+            ff_mask = base_ff_mask.copy()
+            if dilate_k > 1:
+                kernel_d = np.ones((dilate_k, dilate_k), np.uint8)
+                img_for_fill = cv2.dilate(src_img, kernel_d, iterations=1)
+            else:
+                img_for_fill = src_img
+
+            # Debug: save both the starting (src_img) and the dilated image
+            try:
+                base_dir = os.path.dirname(os.path.abspath(__file__))
+                out_dir = os.path.join(base_dir, "flood_fill_debug")
+                os.makedirs(out_dir, exist_ok=True)
+
+                def save_with_shape(name, img):
+                    h_dbg, w_dbg = img.shape[:2]
+                    preview = img.copy()
+                    cv2.putText(preview, f"{w_dbg}x{h_dbg}", (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+                    cv2.imwrite(os.path.join(out_dir, name), preview)
+
+                # Save only once per sweep for the base preprocessed image (k annotated)
+                save_with_shape(f"starting_src_img_gap_{gap_px}.png", src_img)
+                save_with_shape(f"dilated_k_{dilate_k}.png", img_for_fill)
+            except Exception as e:
+                print(f"Debug save failed (k={dilate_k}): {e}")
+
+            aggressiveness = self.aggressiveness_slider['slider'].value()
+            try:
+                cv2.floodFill(
+                    img_for_fill, ff_mask, (int(sx), int(sy)), (255, 255, 255),
+                    (aggressiveness,) * 3, (aggressiveness,) * 3,
+                    flags=cv2.FLOODFILL_MASK_ONLY | cv2.FLOODFILL_FIXED_RANGE
+                )
+            except Exception as ex:
+                print(f"floodFill failed at dilation k={dilate_k}: {ex}")
+                return None, 0
+
+            region = ff_mask[1:-1, 1:-1]  # 0/1 inside border
+            area = int(np.count_nonzero(region))
+            if area == 0:
+                return None, 0
+            return (region.astype(np.uint8) * 255), area
+        # === Helper: single flood with erosion k on a provided source image ===
+        def _flood_with_erode(erode_k: int, src_img: np.ndarray):
+            """
+            Perform a flood fill after eroding src_img with kernel size erode_k.
+            erode_k: erosion kernel size (>=1). If 1, no erosion applied.
+            Returns: (mask_u8, area_pixels)
+            """
+            ff_mask = base_ff_mask.copy()
+            if erode_k > 1:
+                kernel_e = np.ones((erode_k, erode_k), np.uint8)
+                img_for_fill = cv2.erode(src_img, kernel_e, iterations=1)
+            else:
+                img_for_fill = src_img
+
+            # Debug save
+            try:
+                base_dir = os.path.dirname(os.path.abspath(__file__))
+                out_dir = os.path.join(base_dir, "flood_fill_debug")
+                os.makedirs(out_dir, exist_ok=True)
+
+                def save_with_shape(name, img):
+                    hh, ww = img.shape[:2]
+                    preview = img.copy()
+                    cv2.putText(preview, f"{ww}x{hh}", (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+                    cv2.imwrite(os.path.join(out_dir, name), preview)
+
+                save_with_shape(f"erode_start_gap_{gap_px}.png", src_img)
+                save_with_shape(f"eroded_k_{erode_k}.png", img_for_fill)
+            except Exception as e:
+                print(f"Debug save failed (erode_k={erode_k}): {e}")
+
+            aggressiveness = self.aggressiveness_slider['slider'].value()
+            try:
+                cv2.floodFill(
+                    img_for_fill, ff_mask, (int(sx), int(sy)), (255, 255, 255),
+                    (aggressiveness,) * 3, (aggressiveness,) * 3,
+                    flags=cv2.FLOODFILL_MASK_ONLY | cv2.FLOODFILL_FIXED_RANGE
+                )
+            except Exception as ex:
+                print(f"floodFill failed at erosion k={erode_k}: {ex}")
+                return None, 0
+
+            region = ff_mask[1:-1, 1:-1]
+            area = int(np.count_nonzero(region))
+            if area == 0:
+                return None, 0
+            return (region.astype(np.uint8) * 255), area
+
+        # === 5) Flood fill with adaptive dilation selection ===
+        # start_dilate = max(2, gap_px * 2)
+        # min_dilate = 1
+        # area_growth_ratio = 1.20
+
+        # best_mask = None
+        # best_area = 0
+        # starting_mask, starting_area = _flood_with_erode(start_dilate, prep_img)
+        # if starting_mask is None:
+        #     print("Flood produced no region (initial dilation).")
+        #     return
+        # best_mask = starting_mask
+        # best_area = starting_area
+        # prev_mask = starting_mask
+        # prev_area = starting_area
+
+        # === 5) Flood fill with adaptive erosion (replacing dilation loop) ===
+        start_erode = 1                 # begin with no erosion
+        max_erode = max(2, gap_px * 1)  # increase erosion size
+        area_growth_ratio = 1.35  # allow up to 20% growth vs baseline; beyond that is considered a leak
+
+        best_mask = None
+        best_area = 0
+        # Baseline at strongest erosion (smallest region) to detect expansion as we relax
+        starting_mask, starting_area = _flood_with_erode(max_erode, prep_img)
+        if starting_mask is None:
+            print("Flood produced no region (initial erosion).")
             return
-        new_region_u8 = (new_region * 255).astype(np.uint8)
+        best_mask = starting_mask
+        best_area = starting_area
+        prev_mask = starting_mask
+        prev_area = starting_area
 
-        # Prepare age map
+        for k in range(max_erode - 1, start_erode - 1, -1):
+            mask_k, area_k = _flood_with_erode(k, flood_source)  # REPLACED _flood_with_dilation with _flood_with_erode
+            if mask_k is None:
+                print(f"[Adaptive Erosion] No region at erosion k={k}, using previous k.")
+                break
+
+            # Stop if area expands too much compared to baseline (potential leak outside intended boundary)
+            if area_k > starting_area * area_growth_ratio:
+                print(f"[Adaptive Erosion] Area expansion leak at k={k}: {area_k} (> {starting_area * area_growth_ratio:.0f}). Reverting to k={k+1}.")
+                best_mask = prev_mask
+                best_area = prev_area
+                break
+
+            prev_mask = mask_k
+            prev_area = area_k
+            best_mask = mask_k
+            best_area = area_k
+
+            if k == start_erode:
+                print(f"[Adaptive Erosion] Reached minimal erosion k={k} without excessive expansion. Using this mask (area={area_k}).")
+
+        new_region_u8 = best_mask
+        print(f"[Adaptive Erosion] Selected flood area={best_area} pixels (baseline={starting_area}).")
+
+
+        # Prepare / validate age map
         if getattr(self, 'mask_age', None) is None or (self.mask is not None and self.mask_age.shape != self.mask.shape):
-            # Initialize when first needed or on size change
             base_shape = new_region_u8.shape if self.mask is None else self.mask.shape
             self.mask_age = np.zeros(base_shape, dtype=np.uint16)
 
-        # Track existing mask before integration (for age update and post-closing diff)
         existing_before = np.zeros_like(new_region_u8, dtype=bool) if self.mask is None else (self.mask > 0)
 
-        # === 6) Integrate with existing mask (limit outward growth; allow bridging) ===
+        # === 6) Integrate with existing mask (bridging logic) ===
         if self.mask is None:
-            # 6b) New component path: first component → accept whole region
             addition = new_region_u8
-            # 6d) Age update: increment existing (none), set new pixels age=0
-            # (existing_before is empty)
             self.mask_age[addition > 0] = 0
             self.mask = addition
         else:
-            # 6a) Connected components of existing mask
             existing_bin = (self.mask > 0).astype(np.uint8)
             _, labels = cv2.connectedComponents(existing_bin, connectivity=8)
-
-            # Determine if seed is inside an existing component
-            seed_label = 0
-            if 0 <= sy < h and 0 <= sx < w:
-                seed_label = labels[sy, sx]
+            seed_label = labels[sy, sx] if (0 <= sy < h and 0 <= sx < w) else 0
 
             if seed_label == 0:
-                # 6b) Seed not in any component → add full new region (minus overlap)
                 addition = cv2.bitwise_and(new_region_u8, cv2.bitwise_not(self.mask))
             else:
-                # 6c) Bridging path → restrict expansion from the component and bias toward other components
                 comp_mask = np.where(labels == seed_label, 255, 0).astype(np.uint8)
                 others_mask = np.where((labels != 0) & (labels != seed_label), 255, 0).astype(np.uint8)
                 new_pixels = cv2.bitwise_and(new_region_u8, cv2.bitwise_not(self.mask))
 
                 if cv2.countNonZero(new_pixels) > 0:
-                    geodesic_iters = gap_px * 3  # tunable corridor length
+                    geodesic_iters = gap_px * 3
                     candidate_region = cv2.bitwise_or(comp_mask, new_pixels)
                     geodesic_allowed = self.geodesic_limit_dilation(
                         comp_mask, candidate_region, max_iters=geodesic_iters, se_size=3
@@ -468,16 +628,14 @@ class FloodFillApp(QMainWindow):
                     geodesic_new_only = cv2.bitwise_and(geodesic_allowed, new_pixels)
 
                     if cv2.countNonZero(others_mask) > 0:
-                        # DistanceTransform expects 0 as targets; invert others
                         others_inv = np.where(others_mask == 0, 255, 0).astype(np.uint8)
                         dt = cv2.distanceTransform(others_inv, cv2.DIST_L2, 3)
-                        bridge_radius_px = gap_px * 4  # tunable reach
+                        bridge_radius_px = gap_px * 4
                         near_others = (dt <= bridge_radius_px).astype(np.uint8) * 255
                         bridge_allowed = cv2.bitwise_and(geodesic_new_only, near_others)
                     else:
                         bridge_allowed = geodesic_new_only
 
-                    # Include direct neighbours of other components to ensure contact merges
                     if cv2.countNonZero(others_mask) > 0:
                         touching_kernel = np.ones((3, 3), np.uint8)
                         dil_others = cv2.dilate(others_mask, touching_kernel, iterations=1)
@@ -488,55 +646,43 @@ class FloodFillApp(QMainWindow):
                 else:
                     addition = np.zeros_like(self.mask, dtype=np.uint8)
 
-            # 6d) Age map update:
-            # - Increment age of previously existing mask pixels
-            self.mask_age[existing_before] = np.minimum(self.mask_age[existing_before] + 1, np.iinfo(self.mask_age.dtype).max)
-            # - New pixels start at age 0
-            new_pixels_bool = addition > 0
-            self.mask_age[new_pixels_bool] = 0
-            # - Merge mask
+            self.mask_age[existing_before] = np.minimum(
+                self.mask_age[existing_before] + 1,
+                np.iinfo(self.mask_age.dtype).max
+            )
+            self.mask_age[addition > 0] = 0
             self.mask = cv2.bitwise_or(self.mask, addition)
 
-        # === 7) Local cleanup (closing) clamped to a mild envelope to avoid bulging ===
+        # === 7) Local cleanup (closing) ===
         local_radius = max(1, gap_px)
-        se_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*local_radius+1, 2*local_radius+1))
+        se_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * local_radius + 1, 2 * local_radius + 1))
         pre_close_mask = (self.mask > 0)
         closed = cv2.morphologyEx(self.mask, cv2.MORPH_CLOSE, se_close)
         envelope = cv2.dilate(self.mask, se_close, iterations=1)
         self.mask = cv2.bitwise_and(closed, envelope)
-        # Update age for pixels added by closing this iteration
         post_mask = (self.mask > 0)
         closed_added = post_mask & (~pre_close_mask)
         if np.any(closed_added):
             self.mask_age[closed_added] = 0
-        # Clear age for pixels removed (safety)
         removed = (~post_mask) & (existing_before | (self.mask_age > 0))
         if np.any(removed):
             self.mask_age[removed] = 0
 
-        # === 8) Overlay rendering (newest bright red, older darker red) ===
+        # === 8) Overlay rendering ===
         overlay = self.original_image.copy()
-        # Parameters for shading
-        age_step = 20          # red decrease per age level
-        min_red = 40           # clamp so it stays visible
-        max_age_render = 10    # cap effect to avoid going too dark
-
+        age_step = 20
+        min_red = 40
+        max_age_render = 10
         mask_bool = self.mask > 0
         if np.any(mask_bool):
-            # Compute red channel per pixel from age
             age_eff = np.minimum(self.mask_age, max_age_render).astype(np.int32)
-            red_map = 255 - age_step * age_eff
-            red_map = np.clip(red_map, min_red, 255).astype(np.uint8)
-
-            # Apply BGR per pixel in masked area (pure red with per-pixel intensity)
-            # Zero B and G where masked, set R by red_map
+            red_map = np.clip(255 - age_step * age_eff, min_red, 255).astype(np.uint8)
             overlay[..., 0][mask_bool] = 0
             overlay[..., 1][mask_bool] = 0
             overlay[..., 2][mask_bool] = red_map[mask_bool]
-
         blended = cv2.addWeighted(self.original_image, 0.7, overlay, 0.3, 0)
 
-        # === 9) Debug save (overwrite latest) ===
+        # === 9) Debug save ===
         try:
             base_dir = os.path.dirname(os.path.abspath(__file__))
             out_dir = os.path.join(base_dir, "blend_debug_output")
@@ -632,7 +778,7 @@ class FloodFillApp(QMainWindow):
         if doc.page_count == 0:
             return
         page = doc.load_page(0)
-        pix = page.get_pixmap(dpi=200)  # 300 is a good starting point, can go higher
+        pix = page.get_pixmap(dpi=300)  # 300 is a good starting point, can go higher
         img = np.frombuffer(pix.samples, dtype=np.uint8).reshape((pix.height, pix.width, pix.n))
 
         if img.shape[2] == 4:
@@ -708,20 +854,6 @@ class FloodFillApp(QMainWindow):
         if hasattr(self, 'skeleton_contours') and self.skeleton_contours is not None:
             cv2.drawContours(flood_img, self.skeleton_contours, -1, (255, 0, 0), 2)
 
-        # # Optionally, blend the skeleton overlay image (red lines) if you want
-        # if self.skeleton_overlay_img is not None:
-        #     if self.skeleton_overlay_img.shape == flood_img.shape:
-        #         flood_img = cv2.addWeighted(flood_img, 0.1, self.skeleton_overlay_img, 1.0, 0)
-        #     else:
-        #         skeleton_resized = cv2.resize(
-        #             self.skeleton_overlay_img,
-        #             (flood_img.shape[1], flood_img.shape[0]),
-        #             interpolation=cv2.INTER_LINEAR
-        #         )
-        #         flood_img = cv2.addWeighted(flood_img, 0.7, skeleton_resized, 0.5, 0)
-
-            #####   place all objects on canvas above this line   #####
-
         # Resize image to fit canvas, considering zoom and pan
         h, w = flood_img.shape[:2]
         scale = self.zoom_level
@@ -796,72 +928,6 @@ class FloodFillApp(QMainWindow):
                     painter.drawEllipse(QPoint(x, y), 8, 8)
             painter.end()
                 # Draw skeleton best-fit lines in cyan
-
-        # #         #new logic to find closed polygon from skeleton_fit_lines
-        # # if hasattr(self, 'skeleton_fit_lines') and self.skeleton_fit_lines:
-        # #     painter = QPainter(self.canvas.pixmap())
-        # #     pen = QPen(QColor(0, 255, 255), 3)  # Cyan, width 3
-        # #     pen.setCapStyle(Qt.RoundCap)
-        # #     painter.setPen(pen)
-        # #     for pt1, pt2 in self.skeleton_fit_lines:
-        # #         x1, y1 = self.image_to_canvas_coords(pt1[0], pt1[1])
-        # #         x2, y2 = self.image_to_canvas_coords(pt2[0], pt2[1])
-        # #         painter.drawLine(x1, y1, x2, y2)
-        # #     # Draw intersection points as magenta circles
-        # #     if hasattr(self, 'skeleton_fit_intersections'):
-        # #         pen = QPen(QColor(255, 0, 255), 2)
-        # #         painter.setPen(pen)
-        # #         for pt in self.skeleton_fit_intersections:
-        # #             x, y = self.image_to_canvas_coords(pt[0], pt[1])
-        # #             painter.drawEllipse(QPoint(x, y), 8, 8)
-
-        # #     # --- Draw closed polygon overlay from skeleton_fit_lines ---
-        # #     closed_shape = self.find_closed_shape(self.skeleton_fit_lines, tolerance=10)
-        # #     if closed_shape and len(closed_shape) > 2:
-        # #         # Convert to canvas coordinates
-        # #         poly_points = [QPoint(*self.image_to_canvas_coords(x, y)) for x, y in closed_shape]
-        # #         pen = QPen(QColor(255, 128, 0, 180), 4)  # Orange, semi-transparent
-        # #         painter.setPen(pen)
-        # #         painter.setBrush(QColor(255, 128, 0, 80))  # Fill with transparent orange
-        # #         painter.drawPolygon(*poly_points)
-        # #     painter.end()
-
-
-        # # Draw simplified2_approx_closed_line if it exists
-        # if hasattr(self, 'simplified2_approx_closed_line') and self.simplified2_approx_closed_line is not None:
-        #     cv2.drawContours(flood_img, [self.simplified2_approx_closed_line], -1, (255, 0, 255), 2)
-        #     self.statusBar().showMessage("started Simplified Contour 2 method, with simplified2_approx_closed_line")
-        # #Draw simplified main closed line if it exists
-        # if hasattr(self, 'simplified2_main_closed_line') and self.simplified2_main_closed_line is not None:
-        #     cv2.drawContours(flood_img, [self.simplified2_main_closed_line], -1, (0, 0, 255), 2)  # Red or any color
-        # # if hasattr(self, 'simplified2_main_closed_line') and self.simplified2_main_closed_line is not None:
-        # #     painter = QPainter(self.canvas.pixmap())
-        # #     # Blue for the main closed line
-        # #     pen = QPen(QColor(255, 0, 0))  
-        # #     pen.setWidth(2)
-        # #     pen.setCapStyle(Qt.RoundCap)
-        # #     painter.setPen(pen)
-        # #     # Extract x, y coordinates
-        # #     closed_line = self.simplified2_main_closed_line.reshape(-1, 2)
-        # #     for i in range(len(closed_line)):
-        # #         x1, y1 = closed_line[i - 1]
-        # #         x2, y2 = closed_line[i]
-        # #         cx1, cy1 = self.image_to_canvas_coords(x1, y1)
-        # #         cx2, cy2 = self.image_to_canvas_coords(x2, y2)
-        # #         painter.drawLine(cx1, cy1, cx2, cy2)
-        # #     painter.end()
-
-        #     # Draw simplified2_approx_closed_line if it exists
-        # if hasattr(self, 'simplified2_approx_closed_line') and self.simplified2_approx_closed_line is not None:
-        #     cv2.drawContours(flood_img, [self.simplified2_approx_closed_line], -1, (255, 0, 255), 2)
-        #     self.statusBar().showMessage("started Simplified Contour 2 method, with simplified2_approx_closed_line")
-        #     # Draw simplified2_parallel_contours if they exist
-        # if hasattr(self, 'simplified2_parallel_contours') and self.simplified2_parallel_contours:
-        #     cv2.drawContours(flood_img, self.simplified2_parallel_contours, -1, (0, 0, 255), 2)  # Red, or any color you like
-        #      # Draw long line contours if present
-        
-
-        # Check if skeleton overlay exists and blend if so
 
     def clear_canvas(self):
         if hasattr(self, 'original_image') and self.original_image is not None:
@@ -1070,83 +1136,6 @@ class FloodFillApp(QMainWindow):
 
     def update_aggressiveness_value_label(self, v):
         self.aggressiveness_slider['value_label'].setText(str(int(float(v))))
-
-    # def create_simplified_contour(self):
-    #     if self.mask is None or np.count_nonzero(self.mask) == 0:
-    #         return
-
-    #     # Dilate mask to move bounds closer to center of black lines
-    #     dilate_amt = max(1, int(round(self.pixel_slider['slider'].value() * 1.23)))
-    #     kernel = np.ones((dilate_amt, dilate_amt), np.uint8)
-    #     mask_dilated = cv2.dilate(self.mask, kernel, iterations=1)
-
-    #     # Apply morphological closing/opening with kernel size from slider
-    #     kernel_size = self.pixel_slider['slider'].value()
-    #     if kernel_size > 1:
-    #         kernel2 = np.ones((kernel_size, kernel_size), np.uint8)
-    #         mask_for_contours = cv2.morphologyEx(mask_dilated, cv2.MORPH_CLOSE, kernel2)
-    #     else:
-    #         mask_for_contours = mask_dilated.copy()
-
-    #     if mask_for_contours.max() > 1:
-    #         mask_for_contours = (mask_for_contours > 0).astype(np.uint8) * 255
-    #     contours, _ = cv2.findContours(mask_for_contours, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
-    #     if not contours:
-    #         return
-
-    #     # --- JOIN ADJACENT CONTOURS AT ENDPOINTS IF CLOSE ---
-    #     # join_distance = 20  # pixels
-    #     join_distance = kernel_size * 2.5
-    #     merged = [c.squeeze(axis=1) if len(c.shape) == 3 else c for c in contours]
-    #     changed = True
-    #     while changed and len(merged) > 1:
-    #         changed = False
-    #         for i in range(len(merged)):
-    #             for j in range(i + 1, len(merged)):
-    #                 ci, cj = merged[i], merged[j]
-    #                 # Endpoints
-    #                 ends_i = [ci[0], ci[-1]]
-    #                 ends_j = [cj[0], cj[-1]]
-    #                 # Find closest pair of endpoints
-    #                 dists = np.array([[np.linalg.norm(ei - ej) for ej in ends_j] for ei in ends_i])
-    #                 min_idx = np.unravel_index(np.argmin(dists), dists.shape)
-    #                 if dists[min_idx] < join_distance:
-    #                     # Merge contours at closest endpoints
-    #                     ei_idx, ej_idx = min_idx
-    #                     # Reverse as needed to join ends
-    #                     if ei_idx == 0:
-    #                         ci = ci[::-1]
-    #                     if ej_idx == 1:
-    #                         cj = cj[::-1]
-    #                     # Concatenate, avoid duplicate point
-    #                     new_contour = np.vstack([ci, cj[1:]])
-    #                     # Replace and remove
-    #                     merged[i] = new_contour
-    #                     merged.pop(j)
-    #                     changed = True
-    #                     break
-    #             if changed:
-    #                 break
-
-    #     if not merged:
-    #         return
-
-    #     largest_contour = max(merged, key=lambda c: cv2.contourArea(c.reshape(-1, 1, 2)))
-    #     largest_contour = largest_contour.reshape(-1, 1, 2)
-    #     # ---------------------------------------------------
-
-    #     slider_value = self.simplify_slider['slider'].value()  # 1-100
-    #     epsilon = (slider_value / 1000.0) * cv2.arcLength(largest_contour, True)  # 0.001–0.1 * arcLength
-    #     simplified = cv2.approxPolyDP(largest_contour, epsilon, True)
-
-    #     print(f"Original points: {len(largest_contour)}, Simplified: {len(simplified)}, Epsilon: {epsilon:.4f}, Kernel: {kernel_size}")
-
-    #     self.decimated_contour = simplified
-
-    #     contour_img = self.original_image.copy()
-    #     cv2.drawContours(contour_img, [simplified], -1, (255, 0, 255), 2)
-    #     self.image = contour_img
-    #     self.update_canvas_image()          
 
     def canvas_to_image_coords(self, x, y):
         """Convert canvas (widget) coordinates to image coordinates, considering pan and zoom."""
@@ -1691,154 +1680,6 @@ class FloodFillApp(QMainWindow):
         img = np.clip(img, 0, 255).astype(np.uint8)
         return img
 
-    def create_simplified_contour_2(self):
-        if self.mask is None or np.count_nonzero(self.mask) == 0:
-            return
-
-        mask_orig = (self.mask > 0).astype(np.uint8) * 255
-        contours, _ = cv2.findContours(mask_orig, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            return
-        outer_contour = max(contours, key=cv2.contourArea)
-
-        expand_amt = max(1, int(self.pixel_slider['slider'].value() * 4))
-        kernel = np.ones((expand_amt, expand_amt), np.uint8)
-        mask_expanded = cv2.dilate(mask_orig, kernel, iterations=1)
-        contours_exp, _ = cv2.findContours(mask_expanded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours_exp:
-            return
-        outer_contour_exp = max(contours_exp, key=cv2.contourArea)
-
-        mask_between = np.zeros_like(mask_orig)
-        cv2.drawContours(mask_between, [outer_contour_exp], -1, 255, thickness=cv2.FILLED)
-        cv2.drawContours(mask_between, [outer_contour], -1, 0, thickness=cv2.FILLED)
-
-        yellow_mask = np.zeros_like(self.original_image)
-        yellow_mask[mask_between > 0] = (0, 255, 255)  # Yellow
-
-        # 1. Get the underlaid image (use contrast/brightness adjusted or self.original_image)
-        underlaid = self.apply_contrast_brightness_preserve_white(self.original_image, 1.0, 0)  # or use your adjusted image
-
-        # 2. Convert to grayscale
-        gray = cv2.cvtColor(underlaid, cv2.COLOR_BGR2GRAY)
-
-        # 3. Apply threshold or edge detection
-        # Option 1: Simple threshold
-        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        # Option 2: Canny edge detection (for dashed/complex lines, sometimes better)
-        # binary = cv2.Canny(gray, 50, 150)
-
-        # 4. Find contours on the binary image
-        masked_binary = cv2.bitwise_and(binary, binary, mask=mask_between)
-        all_contours, _ = cv2.findContours(masked_binary, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-        long_line_contours = []
-        min_length = 20  # Adjust as needed for "long" lines
-
-        for cnt in all_contours:
-            arc_len = cv2.arcLength(cnt, False)
-            if arc_len > min_length:
-                epsilon = 0.01 * arc_len
-                approx = cv2.approxPolyDP(cnt, epsilon, False)
-                long_line_contours.append(approx)
-        print(f"Found {len(long_line_contours)} long line contours")
-        self.simplified2_long_line_contours = long_line_contours if long_line_contours else None
-        
-        # Store other overlays as before
-        self.simplified2_yellow_mask = yellow_mask
-        self.simplified2_inner_contour = outer_contour
-        self.simplified2_outer_contour = outer_contour_exp
-
-        self.update_canvas_image()
-        # # Find all contours in the yellow mask
-        # all_contours, _ = cv2.findContours(mask_between, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-        # epsilon_outer = 0.01 * cv2.arcLength(outer_contour, True)
-        # approx_outer = cv2.approxPolyDP(outer_contour, epsilon_outer, True)
-
-        # # parallel_contours = []
-        # # angle_threshold = 10  # degrees
-
-        # # for cnt in all_contours:
-        # #     if cv2.contourArea(cnt) < 100:  # skip small contours
-        # #         continue
-        # #     # Approximate contour
-        # #     epsilon = 0.01 * cv2.arcLength(cnt, True)
-        # #     approx = cv2.approxPolyDP(cnt, epsilon, True)
-        # #     # Compare angles with outer contour
-        # #     if len(approx) < 2 or len(approx_outer) < 2:
-        # #         continue
-        # #     angles_inner = []
-        # #     angles_outer = []
-        # #     for i in range(len(approx)):
-        # #         p1 = approx[i][0]
-        # #         p2 = approx[(i+1)%len(approx)][0]
-        # #         v = p2 - p1
-        # #         angle = np.arctan2(v[1], v[0])
-        # #         angles_inner.append(angle)
-        # #     for i in range(len(approx_outer)):
-        # #         p1 = approx_outer[i][0]
-        # #         p2 = approx_outer[(i+1)%len(approx_outer)][0]
-        # #         v = p2 - p1
-        # #         angle = np.arctan2(v[1], v[0])
-        # #         angles_outer.append(angle)
-        # #     # Compare mean angle difference
-        # #     mean_angle_inner = np.mean(angles_inner)
-        # #     mean_angle_outer = np.mean(angles_outer)
-        # #     angle_diff = np.abs(np.rad2deg(mean_angle_inner - mean_angle_outer))
-        # #     if angle_diff > 180:
-        # #         angle_diff = 360 - angle_diff
-        # #     if angle_diff < angle_threshold:
-        # #         parallel_contours.append(approx)
-
-        # # # Fit lines to each parallel contour and extend to intersection
-        # # # For simplicity, use the largest parallel contour
-        # # if parallel_contours:
-        # #     largest = max(parallel_contours, key=cv2.contourArea)
-        # #     # Fit lines to each segment
-        # #     lines = []
-        # #     for i in range(len(largest)):
-        # #         p1 = largest[i][0]
-        # #         p2 = largest[(i+1)%len(largest)][0]
-        # #         lines.append((p1, p2))
-        # #     # Find intersections
-        # #     def line_intersection(line1, line2):
-        # #         xdiff = (line1[0][0] - line1[1][0], line2[0][0] - line2[1][0])
-        # #         ydiff = (line1[0][1] - line1[1][1], line2[0][1] - line2[1][1])
-        # #         def det(a, b):
-        # #             return a[0] * b[1] - a[1] * b[0]
-        # #         div = det(xdiff, ydiff)
-        # #         if div == 0:
-        # #             return None
-        # #         d = (det(*line1), det(*line2))
-        # #         x = det(d, xdiff) / div
-        # #         y = det(d, ydiff) / div
-        # #         return int(x), int(y)
-        # #     intersections = []
-        # #     for i in range(len(lines)):
-        # #         l1 = lines[i]
-        # #         l2 = lines[(i+1)%len(lines)]
-        # #         pt = line_intersection(l1, l2)
-        # #         if pt is not None:
-        # #             intersections.append([[pt]])
-        # #     approx_poly = np.array(intersections, dtype=np.int32)
-        # #     self.simplified2_approx_closed_line = approx_poly
-        # #     # Print the list of vertices
-        # #     print("simplified2_approx_closed_line vertices:")
-        # #     for pt in approx_poly.reshape(-1, 2):
-        # #         print(tuple(pt))
-        # #     self.simplified2_parallel_contours = parallel_contours
-        # # else:
-        # #     self.simplified2_approx_closed_line = None
-        # #     self.simplified2_parallel_contours = None
-        # #     print("simplified2_approx_closed_line vertices: none")
-
-        # self.simplified2_yellow_mask = yellow_mask
-        # self.simplified2_inner_contour = outer_contour
-        # self.simplified2_outer_contour = outer_contour_exp
-        # # self.image = blended
-        # self.update_canvas_image()
-        
-        # --- Find, simplify, and store long line contours ---
-
     #active method is create_simplified_contour_3
     def create_simplified_contour_3(self):
         if self.mask is None or np.count_nonzero(self.mask) == 0:
@@ -1871,7 +1712,7 @@ class FloodFillApp(QMainWindow):
         underlaid = self.apply_contrast_brightness_preserve_white(self.original_image, 1.0, 0)  # or use your adjusted image
 
         # 2. Convert to grayscale
-        gray = cv2.cvtColor(underlaid, cv2.COLOR_BGR2GRAY)
+        gray = cv2.cvtColor(underlaid, cv2.COLOR_BGR2GRAY) if len(underlaid.shape) == 3 else underlaid
 
         # 3. Apply threshold or edge detection
         # Option 1: Simple threshold
@@ -2258,12 +2099,142 @@ class FloodFillApp(QMainWindow):
         # 5. Save the overlay image
         cv2.imwrite(output_path, overlay)
         print(f"Centerline and mask overlay saved to {output_path}")
+         # Usage:
+        # self.save_centerline_and_mask_overlay(mask_between, self.original_image)
+   
+    def _compute_flood_mask_with_gap(self, gap_k: int):
+        """
+        Run a single flood fill pass using erosion kernel size gap_k, starting from the last seed.
+        Returns: (mask_u8, outer_contour or None)
+        mask_u8 is 0/255 uint8.
+        """
+        if self.original_image is None or not self.seed_points:
+            return None, None
 
-    # Usage:
-    # self.save_centerline_and_mask_overlay(mask_between, self.original_image)
+        img = self.original_image
+        h, w = img.shape[:2]
+        sx, sy = self.seed_points[-1]
+
+        # Build ff_mask with 1-px border and brown-line barriers
+        ff_mask = np.zeros((h + 2, w + 2), np.uint8)
+        ff_mask[0, :] = 1; ff_mask[-1, :] = 1
+        ff_mask[:, 0] = 1; ff_mask[:, -1] = 1
+
+        if self.brown_lines:
+            for pt1, pt2 in self.brown_lines:
+                p1 = (int(pt1[0]) + 1, int(pt1[1]) + 1)
+                p2 = (int(pt2[0]) + 1, int(pt2[1]) + 1)
+                cv2.line(ff_mask, p1, p2, color=1, thickness=5)
+
+        # Erode source to pre-close narrow gaps
+        if gap_k > 1:
+            kernel_gap = np.ones((gap_k, gap_k), np.uint8)
+            prep_img = cv2.erode(img, kernel_gap)
+        else:
+            prep_img = img
+
+        # Aggressiveness as currently set
+        aggressiveness = self.aggressiveness_slider['slider'].value()
+
+        # Flood from the last seed
+        try:
+            cv2.floodFill(
+                prep_img, ff_mask, (int(sx), int(sy)), (255, 255, 255),
+                (aggressiveness,)*3, (aggressiveness,)*3,
+                flags=cv2.FLOODFILL_MASK_ONLY | cv2.FLOODFILL_FIXED_RANGE
+            )
+        except Exception:
+            return None, None
+
+        region = ff_mask[1:-1, 1:-1]  # 0/1
+        if np.count_nonzero(region) == 0:
+            return None, None
+
+        mask_u8 = (region.astype(np.uint8)) * 255
+
+        # Largest external contour
+        contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return mask_u8, None
+        outer_contour = max(contours, key=cv2.contourArea)
+        return mask_u8, outer_contour
+
+    def _contour_area_perimeter(self, contour):
+        if contour is None:
+            return 0.0, 0.0
+        area = float(cv2.contourArea(contour))
+        peri = float(cv2.arcLength(contour, True))
+        return area, peri
+
+    def test_kernel_sweep_for_best_fill(self):
+        """
+        Button action:
+        - Decrease erosion kernel size (Gap Pixels) from current down to 1, recomputing flood each step.
+        - Stop when the outer contour perimeter grows by > 20% compared to the previous step (indicates leak/jaggedness).
+        - Select the last good kernel (previous step), apply that mask, and update the view.
+        - If no perimeter growth is detected all the way to k=1, select the result at k=1.
+        """
+        if self.original_image is None or not self.seed_points:
+            self.statusBar().showMessage("Load an image and set at least one seed point first.")
+            return
+
+        start_k = max(1, int(self.pixel_slider['slider'].value()))
+        # Decrease kernel down to 1
+        k_values = list(range(start_k, 0, -1))
+
+        last_peri = None
+        last_good = None  # (k, mask_u8, contour, area, peri)
+
+        for k in k_values:
+            mask_k, ctr_k = self._compute_flood_mask_with_gap(k)
+            if mask_k is None or ctr_k is None:
+                # No region at this k; if we already had something, stop here
+                if last_good is not None:
+                    break
+                else:
+                    continue
+
+            area_k, peri_k = self._contour_area_perimeter(ctr_k)
+
+            if last_peri is not None:
+                # Leak condition: perimeter grows > 20% versus previous step
+                if peri_k > last_peri * 1.20:
+                    # Stop at first perimeter jump; use last_good
+                    break
+
+            last_good = (k, mask_k, ctr_k, area_k, peri_k)
+            last_peri = peri_k
+
+        # If we never tripped the perimeter growth condition, pick the final evaluated (k=1) result
+        chosen = last_good
+        if chosen is None:
+            self.statusBar().showMessage("Kernel sweep found no valid flood region.")
+            return
+
+        chosen_k, chosen_mask_u8, chosen_ctr, area_c, peri_c = chosen
+
+        # Apply selected mask
+        self.mask = chosen_mask_u8.copy()
+        self.mask_age = np.zeros_like(self.mask, dtype=np.uint16)
+
+        # Reflect chosen kernel in the Gap Pixels slider
+        self.pixel_slider['slider'].setValue(int(chosen_k))
+        self.pixel_slider['value_label'].setText(str(int(chosen_k)))
+
+        # Update decimated outer contour for display
+        # Simplify a bit for viewing
+        eps = max(1.0, 0.01 * cv2.arcLength(chosen_ctr, True))
+        approx = cv2.approxPolyDP(chosen_ctr, eps, True)
+        # Ensure closed
+        if not np.array_equal(approx[0][0], approx[-1][0]):
+            approx = np.vstack([approx, [approx[0]]])
+        self.decimated_contour = approx
+
+        self.update_canvas_image()
+        self.statusBar().showMessage(f"Kernel sweep (descending): k={chosen_k}, perimeter={peri_c:.0f}, area={area_c:.0f}")
 
 
-
+## never remove the following lines  ##
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     win = FloodFillApp()
