@@ -1,10 +1,9 @@
 ﻿#OCR.Testing_LATEST.py
-
 import sys
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout,
     QPushButton, QGraphicsView, QGraphicsScene, QFileDialog, QSizePolicy,
-    QSlider, QLabel, QHBoxLayout, QRadioButton, QButtonGroup
+    QSlider, QLabel, QHBoxLayout, QRadioButton, QButtonGroup, QProgressBar
 )
 from PyQt5.QtGui import QPixmap, QPalette, QColor, QPen, QImage
 from PyQt5.QtCore import Qt, QRectF, QPointF
@@ -12,6 +11,7 @@ import pytesseract
 import cv2
 import numpy as np
 import re
+import itertools
 
 class ImageViewer(QGraphicsView):
     def __init__(self):
@@ -28,6 +28,9 @@ class ImageViewer(QGraphicsView):
         self._pan_start = None
         self.ocr_boxes = []
         self.selected_box_idx = None
+        self._rect_items = []
+        self.bearings = []
+        self.distances = []
 
     def set_image(self, pixmap, transform=None):
         self.scene().clear()
@@ -83,22 +86,35 @@ class ImageViewer(QGraphicsView):
                     selected = re.sub(r'^(WW)', 'W', selected)
                     selected = re.sub(r'^(NN)', 'N', selected)
                     selected = re.sub(r'^(SS)', 'S', selected)
+                    # If starts with N/W/S/E and contains a '.', remove all '.'
+                    if selected and selected[0] in 'NWSE' and '.' in selected:
+                        selected = selected.replace('.', '')
                     if selected and not (selected[0] in 'NWSE' or selected[0].isdigit()):
                         m = re.search(r'[0-9]', selected)
                         if m:
                             selected = selected[m.start():]
-                    # Remove periods from bearings
-                    if selected and selected[0] in 'NWSE' and '.' in selected:
-                        selected = selected.replace('.', '')
-                    # --- Replace S with 5 if S is not first or last character and text is a bearing ---
-                    if selected and (selected[0] in 'NWSE' or selected[-1] in 'NWSE'):
-                        if len(selected) > 2:
-                            chars = list(selected)
-                            for i in range(1, len(chars)-1):
-                                if chars[i] == 'S':
-                                    chars[i] = '5'
-                            selected = ''.join(chars)
-                    print(f"Selected text: {selected}")
+
+                    # Only process if starts with N/W/S/E or is a decimal number
+                    is_bearing = selected and selected[0] in 'NWSE'
+                    is_decimal = bool(re.match(r'^\d*\.\d+$', selected))
+                    if not is_bearing and not is_decimal:
+                        return
+
+                    if is_bearing:
+                        if len(selected) > 8:
+                            return
+                        self.bearings.append(selected)
+                    if is_decimal:
+                        self.distances.append(selected)
+
+                    if len(self.bearings) < 1:
+                        pass
+                    else:
+                        print("Bearings:", self.bearings)
+                    if len(self.distances) < 1:
+                        pass
+                    else:
+                        print("Distances:", self.distances)
                     return
         if event.button() == Qt.MiddleButton:
             self._panning = True
@@ -136,6 +152,13 @@ class ImageViewer(QGraphicsView):
             rect_item = self.scene().addRect(x, y, w, h, pen)
             self._rect_items.append(rect_item)
 
+    def clear_bearings_and_distances(self):
+        self.bearings.clear()
+        self.distances.clear()
+        print("Bearings cleared:", self.bearings)
+        print("Distances cleared:", self.distances)
+
+    
 def merge_boxes(boxes, x_threshold=20, y_threshold=10):
     if not boxes:
         return []
@@ -185,6 +208,14 @@ class MainWindow(QMainWindow):
         ocr_btn = QPushButton("Highlight Text")
         ocr_btn.clicked.connect(self.highlight_text)
         ocr_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+
+        clear_btn = QPushButton("Clear Bearings/Distances")
+        clear_btn.clicked.connect(self.viewer.clear_bearings_and_distances)
+        clear_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+
+        auto_btn = QPushButton("Auto Find Bearings/Distances")
+        auto_btn.clicked.connect(self.auto_find_clean_bearings_and_distances)
+        auto_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
 
         # --- Mode radio buttons ---
         self.adjust_radio = QRadioButton("Image Adjustment Only")
@@ -297,10 +328,21 @@ class MainWindow(QMainWindow):
         slider_layout.addLayout(slider_row1)
         slider_layout.addLayout(slider_row2)
 
+        # Add progress bar
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setMinimum(0)
+        self.progress_bar.setMaximum(100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setFixedHeight(18)
+        slider_layout.addWidget(self.progress_bar)
+
         # --- Controls layout (buttons + mode) ---
         controls_layout = QHBoxLayout()
         controls_layout.addWidget(load_btn)
         controls_layout.addWidget(ocr_btn)
+        controls_layout.addWidget(clear_btn)
+        controls_layout.addWidget(auto_btn)
         controls_layout.addLayout(radio_layout)
 
         layout = QVBoxLayout()
@@ -314,8 +356,8 @@ class MainWindow(QMainWindow):
         self.resize(800, 400)
 
         self._last_pixmap = None
-        self.connect_sliders(self.highlight_text)  # <-- Connect sliders to highlight_text for text mode
-        self.highlight_text()  # <-- Highlight text on startup
+        self.connect_sliders(self.highlight_text)
+        self.highlight_text()
 
     def connect_sliders(self, slot):
         try:
@@ -390,6 +432,22 @@ class MainWindow(QMainWindow):
             adj = cv2.dilate(adj, kernel, iterations=dilation_iter)
         return adj
 
+    def preprocess_for_ocr_params(self, arr, brightness, contrast, threshold, gaussian):
+        gray = cv2.cvtColor(arr, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        eq = clahe.apply(gray)
+        alpha = contrast / 100.0
+        beta = brightness
+        adj = cv2.convertScaleAbs(eq, alpha=alpha, beta=beta)
+        gaussian_ksize = gaussian
+        if gaussian_ksize % 2 == 0:
+            gaussian_ksize += 1
+        if gaussian_ksize > 1:
+            adj = cv2.GaussianBlur(adj, (gaussian_ksize, gaussian_ksize), 0)
+        if threshold > 0:
+            _, adj = cv2.threshold(adj, threshold, 255, cv2.THRESH_BINARY)
+        return adj
+
     def get_current_image_array(self):
         """Get the current image as a numpy array, applying invert if needed."""
         if not self._last_pixmap:
@@ -420,7 +478,7 @@ class MainWindow(QMainWindow):
         pixmap = QPixmap.fromImage(qimg_pre)
         current_transform = self.viewer.transform()
         self.viewer.set_image(pixmap, transform=current_transform)
-        custom_config = r'--oem 3 --psm 6'
+        custom_config = r'--oem 3 --psm 6 -c tessedit_char_whitelist=NWSE.0123456789'
         data = pytesseract.image_to_data(pre, output_type=pytesseract.Output.DICT, config=custom_config)
         boxes = []
         expand = 4
@@ -440,10 +498,6 @@ class MainWindow(QMainWindow):
                 text = text.replace('-', '')
                 if text.endswith('.'):
                     text = text[:-1]
-                # --- Strip periods from bearings ---
-                # Bearings pattern: starts with N/S/E/W, may have digits and periods, ends with N/S/E/W
-                if re.match(r'^[NSEW][0-9\.]+[NSEW]$', text):
-                    text = text.replace('.', '')
                 if text.strip():
                     x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
                     x_exp = max(0, x - expand)
@@ -475,6 +529,117 @@ class MainWindow(QMainWindow):
         pixmap = QPixmap.fromImage(qimg_pre)
         self.viewer.set_image(pixmap)
 
+    def clear_boxes(self):
+        """Clear the highlighted OCR boxes."""
+        self.viewer.ocr_boxes = []
+        self.viewer.selected_box_idx = None
+        self.viewer._rect_items = []
+        self.viewer.scene().clear()
+        if self._last_pixmap:
+            self.viewer.set_image(self._last_pixmap)
+
+    def auto_find_clean_bearings_and_distances(self):
+        original_bearings = list(self.viewer.bearings)
+        original_distances = list(self.viewer.distances)
+
+        brightness_range = range(-50, 51, 25)
+        contrast_range = range(50, 151, 25)
+        threshold_range = range(0, 201, 50)
+        gaussian_range = range(0, 7, 2)
+
+        param_combinations = list(itertools.product(
+            brightness_range, contrast_range, threshold_range, gaussian_range
+        ))
+        total_combinations = len(param_combinations)
+        attempt = 0
+        found_new_distance = False
+        found_new_bearing = False
+        new_distance = None
+        new_bearing = None
+
+        orig_arr = self.get_current_image_array()
+        if orig_arr is None:
+            print("No image loaded.")
+            return
+
+        sliders = [
+            self.brightness_slider, self.contrast_slider, self.erosion_slider,
+            self.dilation_slider, self.threshold_slider, self.gaussian_slider,
+            self.merge_x_slider, self.merge_y_slider
+        ]
+        for slider in sliders:
+            slider.blockSignals(True)
+            slider.setVisible(False)
+
+        def update_progress():
+            percent = int((attempt / total_combinations) * 100)
+            self.progress_bar.setValue(percent)
+            self.progress_bar.setFormat(f"Attempts: {attempt}/{total_combinations}")
+            QApplication.processEvents()
+
+        for brightness, contrast, threshold, gaussian in param_combinations:
+            attempt += 1
+            pre = self.preprocess_for_ocr_params(orig_arr, brightness, contrast, threshold, gaussian)
+            custom_config = r'--oem 3 --psm 6 -c tessedit_char_whitelist=NWSE.0123456789'
+            data = pytesseract.image_to_data(pre, output_type=pytesseract.Output.DICT, config=custom_config)
+            for i in range(len(data['text'])):
+                text = data['text'][i]
+                if not (text and any(c.isalnum() for c in text)):
+                    continue
+                selected = text.replace(' ', '')
+                selected = re.sub(r'^(EE)', 'E', selected)
+                selected = re.sub(r'^(WW)', 'W', selected)
+                selected = re.sub(r'^(NN)', 'N', selected)
+                selected = re.sub(r'^(SS)', 'S', selected)
+                if selected and selected[0] in 'NWSE' and '.' in selected:
+                    selected = selected.replace('.', '')
+                if selected and not (selected[0] in 'NWSE' or selected[0].isdigit()):
+                    m = re.search(r'[0-9]', selected)
+                    if m:
+                        selected = selected[m.start():]
+                is_decimal = bool(re.match(r'^\d*\.\d+$', selected))
+                is_bearing = selected and selected[0] in 'NWSE' and len(selected) >= 6
+                if is_decimal and not found_new_distance and selected not in self.viewer.distances:
+                    new_distance = selected
+                    self.viewer.distances.append(selected)
+                    found_new_distance = True
+                    print(f"New distance found: {new_distance}")
+                    print("All distances:", self.viewer.distances)
+                if is_bearing and not found_new_bearing and selected not in self.viewer.bearings:
+                    if len(selected) > 8:
+                        continue
+                    if any(x in selected for x in ("EE", "WW", "NN", "SS")):
+                        continue
+                    if not selected[-1] in ("E", "W"):
+                        continue
+                    if selected[-1].isdigit():
+                        continue
+                    new_bearing = selected
+                    self.viewer.bearings.append(selected)
+                    found_new_bearing = True
+                    print(f"New bearing found: {new_bearing}")
+                    print("All bearings:", self.viewer.bearings)
+            if attempt % 10 == 0 or found_new_distance or found_new_bearing:
+                update_progress()
+            if found_new_distance and found_new_bearing:
+                break
+
+        for slider in sliders:
+            slider.blockSignals(False)
+            slider.setVisible(True)
+        self.connect_sliders(self.highlight_text)
+
+        update_progress()
+        if not found_new_distance and not found_new_bearing:
+            self.viewer.bearings = original_bearings
+            self.viewer.distances = original_distances
+            print("No new valid bearing or distance found in tested adjustment ranges.")
+        elif found_new_distance and found_new_bearing:
+            print("Auto-find complete: new distance and bearing found.")
+        elif found_new_distance:
+            print("Auto-find complete: new distance found, no new bearing.")
+        elif found_new_bearing:
+            print("Auto-find complete: new bearing found, no new distance.")
 def set_dark_mode(app):
     dark_palette = QPalette()
     dark_palette.setColor(QPalette.Window, QColor(30, 30, 30))
