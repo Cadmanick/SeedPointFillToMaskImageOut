@@ -277,6 +277,11 @@ class FloodFillApp(QMainWindow):
         self.simplified2_parallel_contours = None
         self.skeleton_overlay_img = None
 
+        # Add debug visualization fields for bridge_outer_boundary_over_text
+        self.debug_detected_boundary_lines = []
+        self.debug_bridge_connectors = []
+        self.bridged_regions_mask = None  # Accumulates all bridged areas across seed points
+
     def _make_slider(self, label, minv, maxv, val, slot=None):
         from PyQt5.QtWidgets import QVBoxLayout, QHBoxLayout, QWidget
         w = QWidget()
@@ -660,12 +665,19 @@ class FloodFillApp(QMainWindow):
         self.bridge_outer_boundary_over_text(
             gap_px, 
             dilate_strip_iters=12, 
-            ransac_residual=1.6, 
+            ransac_residual=1.5, 
             min_line_len_px=40, 
             band_thick=14, 
             guide_thick=16, 
-            close_iters=6, 
-            finalize_max_dev_px=16)
+            close_iters=2, 
+            finalize_max_dev_px=20,
+            # NEW gap bridging params
+            enable_gap_bridging=True,
+            parallel_angle_tol_deg=10.0,  # stricter alignment
+            max_gap_distance=None,         # auto (8× local_radius)
+            bridge_line_thick=1,         # auto (local_radius)
+            min_sample_line_len_px=40  # NEW: explicit control for sample line geometry minimum length
+        )
 
 
         # === 7) Local cleanup (closing) ===
@@ -1025,6 +1037,34 @@ class FloodFillApp(QMainWindow):
                     painter.drawEllipse(QPoint(x, y), 8, 8)
             painter.end()
                 # Draw skeleton best-fit lines in cyan
+        # Draw detected boundary long lines in yellow
+        if hasattr(self, 'debug_detected_boundary_lines') and self.debug_detected_boundary_lines:
+            painter = QPainter(self.canvas.pixmap())
+            pen = QPen(QColor(255, 255, 0, 200))  # Yellow, semi-transparent
+            pen.setWidth(3)
+            pen.setCapStyle(Qt.RoundCap)
+            painter.setPen(pen)
+            for pt1, pt2 in self.debug_detected_boundary_lines:
+                x1, y1 = self.image_to_canvas_coords(pt1[0], pt1[1])
+                x2, y2 = self.image_to_canvas_coords(pt2[0], pt2[1])
+                painter.drawLine(x1, y1, x2, y2)
+            painter.end()
+    
+        # Draw bridge connectors in bright green
+        if hasattr(self, 'debug_bridge_connectors') and self.debug_bridge_connectors:
+            painter = QPainter(self.canvas.pixmap())
+            pen = QPen(QColor(128, 128, 128, 220))  # Bright green
+            pen.setWidth(1)
+            pen.setCapStyle(Qt.RoundCap)
+            painter.setPen(pen)
+            for b1, b2 in self.debug_bridge_connectors:
+                x1, y1 = self.image_to_canvas_coords(b1[0], b1[1])
+                x2, y2 = self.image_to_canvas_coords(b2[0], b2[1])
+                painter.drawLine(x1, y1, x2, y2)
+                # Draw endpoint markers
+                painter.drawEllipse(QPoint(x1, y1), 6, 6)
+                painter.drawEllipse(QPoint(x2, y2), 6, 6)
+            painter.end()
 
     def clear_canvas(self):
         if hasattr(self, 'original_image') and self.original_image is not None:
@@ -1054,6 +1094,11 @@ class FloodFillApp(QMainWindow):
         self.distance_label.setText("Right Click Distance Measure: N/A")
         self.scale_factor_label.setText("Scale Factor: Not set")
         self.update_canvas_image()
+        self.debug_detected_boundary_lines = []
+        self.debug_bridge_connectors = []
+        self.bridged_regions_mask = None  # NEW: Reset bridged regions
+        self.update_canvas_image()
+
 
     def fit_to_view(self):
         if self.image is None:
@@ -2691,10 +2736,20 @@ class FloodFillApp(QMainWindow):
         band_thick: int = None,
         guide_thick: int = None,
         close_iters: int = 2,
-        finalize_max_dev_px: float = 6.0
+        finalize_max_dev_px: float = 6.0,
+        # NEW: gap bridging params
+        enable_gap_bridging: bool = True,
+        parallel_angle_tol_deg: float = 15.0,
+        max_gap_distance: float = None,
+        bridge_line_thick: int = None,
+        # NEW: explicit control for sample line geometry minimum length
+        min_sample_line_len_px: int = None  # NEW PARAMETER
     ):
         """
         Bridge the outer boundary contour across near-parallel text defects lying just outside the mask.
+        Detects pairs of nearly-parallel long lines on opposite sides of text belts and bridges them.
+        Skips areas already bridged in previous seed point operations.
+
         Tunables:
         - dilate_strip_iters: widen the outside strip used to detect/suppress text belts.
         - ransac_residual: residual threshold for long-line detection (lower = stricter).
@@ -2703,6 +2758,11 @@ class FloodFillApp(QMainWindow):
         - guide_thick: thickness of line-guided fill drawn into the envelope.
         - close_iters: closing iterations when reconnecting the boundary.
         - finalize_max_dev_px: snapping tolerance when re-simplifying the updated outer contour.
+        - enable_gap_bridging: enable parallel line detection and bridging.
+        - parallel_angle_tol_deg: max angular difference (degrees) to consider lines parallel.
+        - max_gap_distance: max perpendicular distance between parallel line pairs (auto if None).
+        - bridge_line_thick: thickness of lines drawn to bridge gaps (auto if None).
+        - min_sample_line_len_px: minimum line length for contour sample line geometry creation (overrides min_line_len_px if set).
         """
         if self.mask is None or np.count_nonzero(self.mask) == 0:
             return
@@ -2716,18 +2776,35 @@ class FloodFillApp(QMainWindow):
         # Local scale (base from gap)
         local_radius = int(np.clip(max(1, gap_px), 2, 12))
 
+        # NEW: Use min_sample_line_len_px if provided, otherwise fall back to min_line_len_px or auto-calculate
+        if min_sample_line_len_px is not None:
+            effective_min_line_len = min_sample_line_len_px
+        elif min_line_len_px is not None:
+            effective_min_line_len = min_line_len_px
+        else:
+            effective_min_line_len = max(60, local_radius * 10)
+
         # Derived defaults if not provided
-        if min_line_len_px is None:
-            min_line_len_px = max(60, local_radius * 10)
         if band_thick is None:
             band_thick = max(8, local_radius + 3)
         if guide_thick is None:
             guide_thick = max(3, local_radius - 1)
+        if max_gap_distance is None:
+            max_gap_distance = float(local_radius * 8)  # auto: 8× local radius
+        if bridge_line_thick is None:
+            bridge_line_thick = max(4, local_radius)
 
         # Build widened outside strip next to the current outer contour
         se_rect = cv2.getStructuringElement(cv2.MORPH_RECT, (2 * local_radius + 1, 2 * local_radius + 1))
         dil_wide = cv2.dilate(mask_u8, se_rect, iterations=max(1, int(dilate_strip_iters)))
         outside_strip = cv2.bitwise_and(dil_wide, cv2.bitwise_not(mask_u8))
+    
+        # NEW: Initialize bridged_regions_mask if first call
+        if self.bridged_regions_mask is None:
+            self.bridged_regions_mask = np.zeros_like(mask_u8, dtype=np.uint8)
+        # NEW: Exclude already-bridged areas from the outside strip
+        outside_strip_unbridged = cv2.bitwise_and(outside_strip, cv2.bitwise_not(self.bridged_regions_mask))
+
 
         # Detect longer straight outer boundary runs via sliding-window RANSAC
         ref_pts = ref_outer.reshape(-1, 2).astype(np.float32)
@@ -2754,34 +2831,100 @@ class FloodFillApp(QMainWindow):
                 t_min, t_max = float(np.min(t_vals)), float(np.max(t_vals))
                 p1 = (model.params[0] + t_min * model.params[1]).astype(np.float32)
                 p2 = (model.params[0] + t_max * model.params[1]).astype(np.float32)
-                if float(np.linalg.norm(p2 - p1)) >= float(min_line_len_px):
-                    detected_lines.append((tuple(p1.astype(int)), tuple(p2.astype(int))))
+                # NEW: Use effective_min_line_len instead of min_line_len_px
+                if float(np.linalg.norm(p2 - p1)) >= float(effective_min_line_len):
+                    # Store (p1, p2, direction_unit_vec, origin_point)
+                    direction = model.params[1] / np.linalg.norm(model.params[1])
+                    detected_lines.append((tuple(p1.astype(int)), tuple(p2.astype(int)),
+                                           direction.astype(np.float32), model.params[0].astype(np.float32)))
         except Exception:
             pass
 
         se_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * local_radius + 1, 2 * local_radius + 1))
 
+
+        # NEW: Gap bridging via parallel line pairing (only in unbridged areas)
+        bridge_lines = []
+        if enable_gap_bridging and len(detected_lines) >= 2:
+            def perp_distance(origin1, dir1, origin2):
+                v = origin2 - origin1
+                proj = float(np.dot(v, dir1))
+                perp = v - proj * dir1
+                return float(np.linalg.norm(perp))
+
+            angle_tol_rad = np.deg2rad(parallel_angle_tol_deg)
+            for i in range(len(detected_lines)):
+                p1_i, p2_i, dir_i, orig_i = detected_lines[i]
+                for j in range(i + 1, len(detected_lines)):
+                    p1_j, p2_j, dir_j, orig_j = detected_lines[j]
+        
+                    dot = float(np.abs(np.dot(dir_i, dir_j)))
+                    if dot < np.cos(angle_tol_rad):
+                        continue
+        
+                    dist = perp_distance(orig_i, dir_i, orig_j)
+                    if dist > max_gap_distance:
+                        continue
+        
+                    mid_i = ((np.array(p1_i) + np.array(p2_i)) / 2).astype(np.float32)
+                    mid_j = ((np.array(p1_j) + np.array(p2_j)) / 2).astype(np.float32)
+        
+                    # NEW: Check if ANY part of the bridge line intersects already-bridged areas
+                    # Create a temporary mask with just this proposed bridge
+                    temp_bridge_mask = np.zeros_like(self.bridged_regions_mask, dtype=np.uint8)
+                    cv2.line(temp_bridge_mask, tuple(mid_i.astype(int)), tuple(mid_j.astype(int)), 
+                             255, thickness=int(bridge_line_thick))
+            
+                    # Check for overlap with existing bridged regions
+                    overlap = cv2.bitwise_and(temp_bridge_mask, self.bridged_regions_mask)
+                    if np.count_nonzero(overlap) > 0:
+                        continue  # Skip this bridge - overlaps with already-bridged area
+        
+                    bridge_lines.append((tuple(mid_i.astype(int)), tuple(mid_j.astype(int))))
+
         if detected_lines:
-            # Thicker suppression band, limited to outside strip
+            # ... existing suppression and guided fill code ...
+        
+            # Thicker suppression band, limited to UNBRIDGED outside strip
             longline_band = np.zeros_like(mask_u8, dtype=np.uint8)
-            for p1, p2 in detected_lines:
+            for p1, p2, _, _ in detected_lines:
                 cv2.line(longline_band, p1, p2, 255, thickness=int(band_thick))
             longline_band = cv2.dilate(longline_band, se_close, iterations=1)
 
-            suppression = cv2.bitwise_and(longline_band, outside_strip)
+            # NEW: Use unbridged strip instead of full outside_strip
+            suppression = cv2.bitwise_and(longline_band, outside_strip_unbridged)
 
-            # Envelope minus suppression
             envelope = cv2.dilate(mask_u8, se_close, iterations=1)
             env_after_suppress = cv2.bitwise_and(envelope, cv2.bitwise_not(suppression))
 
-            # Line-guided fill: rasterize long boundary lines back into the envelope to bridge across the text gap
             guided = env_after_suppress.copy()
-            for p1, p2 in detected_lines:
+            for p1, p2, _, _ in detected_lines:
                 cv2.line(guided, p1, p2, 255, thickness=int(guide_thick))
+        
+            for b1, b2 in bridge_lines:
+                cv2.line(guided, b1, b2, 255, thickness=int(bridge_line_thick))
 
-            # Close with the guided envelope
             closed = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, se_close, iterations=int(close_iters))
             self.mask = cv2.bitwise_and(closed, guided)
+
+            # NEW: Mark newly bridged areas in the persistent mask
+            if enable_gap_bridging and bridge_lines:
+                new_bridges_mask = np.zeros_like(mask_u8, dtype=np.uint8)
+                for b1, b2 in bridge_lines:
+                    # Draw bridge with wider thickness to mark the bridged zone
+                    cv2.line(new_bridges_mask, b1, b2, 255, thickness=int(bridge_line_thick * 3))
+                    cv2.line(self.mask, b1, b2, 255, thickness=int(bridge_line_thick))
+            
+                # Dilate the bridge zone to create an exclusion buffer
+                exclusion_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, 
+                                                              (int(max_gap_distance), int(max_gap_distance)))
+                new_bridges_mask = cv2.dilate(new_bridges_mask, exclusion_kernel, iterations=1)
+            
+                # Add to persistent bridged regions mask
+                self.bridged_regions_mask = cv2.bitwise_or(self.bridged_regions_mask, new_bridges_mask)
+            
+                # Re-close to smooth
+                self.mask = cv2.morphologyEx(self.mask, cv2.MORPH_CLOSE, se_close, iterations=1)
         else:
             # Fallback: stronger close+envelope
             closed = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, se_close, iterations=int(close_iters))
@@ -2797,6 +2940,10 @@ class FloodFillApp(QMainWindow):
                          255, thickness=max(4, local_radius))
             protect = cv2.dilate(protect, se_close, iterations=1)
             self.mask[protect > 0] = (pre_close_mask[protect > 0]).astype(np.uint8) * 255
+
+
+        self.debug_detected_boundary_lines = [(p1, p2) for p1, p2, _, _ in detected_lines]
+        self.debug_bridge_connectors = bridge_lines.copy() if bridge_lines else []
 
         # # Optional: re-simplify updated outer contour for display fidelity with tunable snapping tolerance
         # try:
