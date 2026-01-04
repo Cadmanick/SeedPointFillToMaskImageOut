@@ -1,5 +1,8 @@
-#SeedPointFillToMaskImageOut_qt(r9d).py  added below to omit text from outer contour for line detection 2-28-25
-"""self.bridge_outer_boundary_over_text(
+#SeedPointFillToMaskImageOut_qt(r10a).py added place_brown_line_at_bottleneck to find and plug leaks with brown lines automatically 1-4-26
+#SeedPointFillToMaskImageOut_qt(r9d).py  added below to omit text from outer contour for line detection 12-28-25
+""" updated flood_fill_and_show_mask_contours_modular to do heavy lifting for bridging outer boundary over text.
+next step is to reimplement the below method to straighten outer lines.
+self.bridge_outer_boundary_over_text(
             gap_px, 
             dilate_strip_iters=12, 
             ransac_residual=1.6, 
@@ -104,6 +107,10 @@ class FloodFillApp(QMainWindow):
         self.last_contour_distances = None
         self.measure_points = []  # Add to __init__ (after self.line_points = [])
 
+        # Debug toggles
+        self.debug_brown_line_use_half_length = True
+        self.debug_brown_line_rotate_90 = True
+
         # --- Main layout ---
         central = QWidget()
         self.setCentralWidget(central)
@@ -117,7 +124,7 @@ class FloodFillApp(QMainWindow):
         slider_layout.addWidget(self.aggressiveness_slider['widget'])
         slider_layout.addSpacing(20)
 
-        self.pixel_slider = self._make_slider("Gap Pixels", 1, 50, 9)
+        self.pixel_slider = self._make_slider("Gap Pixels", 1, 50, 15)
         slider_layout.addWidget(self.pixel_slider['widget'])
         slider_layout.addSpacing(20)
 
@@ -309,8 +316,6 @@ class FloodFillApp(QMainWindow):
         s.valueChanged.connect(update_value_label)
         return {'widget': w, 'slider': s, 'label': lab, 'value_label': value_label}
 
-    # --- Event Handlers (to be ported from Tkinter logic) ---
-
     def add_seed_point(self, x, y):
         if self.image is None:
             return
@@ -400,29 +405,9 @@ class FloodFillApp(QMainWindow):
             _, peri_k = self._contour_area_perimeter(ctr_k)
 
             if last_peri is not None and peri_k > last_peri * perimeter_jump_ratio:
-                if area_k > starting_area * area_growth_ratio:
-                    print(f"[Leak Detected at k={k}] Placing brown line barrier...")
-    
-                    # Find leak region
-                    leaked_region = cv2.bitwise_xor(prev_mask, mask_k)
-    
-                    # Find narrowest point
-                    narrowest_pt = find_narrowest_point(leaked_region, prev_mask)
-                    if narrowest_pt:
-                        # Get boundary contour
-                        contours, _ = cv2.findContours(prev_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-                        boundary = max(contours, key=cv2.contourArea).reshape(-1, 2)
-        
-                        # Place brown line
-                        pt1, pt2 = place_brown_line_at_bottleneck(narrowest_pt, boundary)
-                        self.brown_lines.append((pt1, pt2))
-                        print(f"Brown line added: {pt1} → {pt2}")
-        
-                        # Continue sweep with new barrier
-                        best_mask = prev_mask
-                        best_area = prev_area
-                        continue  # Re-run with brown line in place
-                    break
+                # Perimeter jump detected - return previous good kernel
+                print(f"[choose_gap_kernel_descending] Perimeter jump at k={k}: {peri_k:.0f} > {last_peri * perimeter_jump_ratio:.0f}")
+                return last_good_k
 
             last_good_k = k
             last_peri = peri_k
@@ -431,11 +416,150 @@ class FloodFillApp(QMainWindow):
                 break
 
         return last_good_k
+ 
+        # === Helper: leak detection and brown line placement ===
+
+    def find_narrowest_point(self, leaked_region, prev_mask):  # ✅ Added self
+        """Find bottleneck where leak occurred."""
+        contours, _ = cv2.findContours(prev_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        if not contours:
+            return None
+        boundary = max(contours, key=cv2.contourArea).reshape(-1, 2)
+    
+        leaked_inv = cv2.bitwise_not(leaked_region)
+        dist_transform = cv2.distanceTransform(leaked_inv, cv2.DIST_L2, 5)
+    
+        min_dist = float('inf')
+        narrowest_pt = None
+        for pt in boundary:
+            d = dist_transform[pt[1], pt[0]]
+            if 0 < d < min_dist:
+                min_dist = d
+                narrowest_pt = tuple(pt)
+    
+        return narrowest_pt
+
+    def _compute_boundary_tangent_and_normal(self, boundary_contour: np.ndarray, pt_xy) -> tuple:
+        """
+        Returns (tangent_unit_vec, normal_unit_vec) at boundary point nearest pt_xy.
+        boundary_contour: Nx2 array.
+        """
+        p = np.array(pt_xy, dtype=np.float32)
+        idx = int(np.argmin(np.linalg.norm(boundary_contour.astype(np.float32) - p[None, :], axis=1)))
+
+        # Wider window reduces local noise. Keep symmetric and odd.
+        k = 7
+        p_prev = boundary_contour[(idx - k) % len(boundary_contour)].astype(np.float32)
+        p_next = boundary_contour[(idx + k) % len(boundary_contour)].astype(np.float32)
+
+        tangent = p_next - p_prev
+        nrm = float(np.linalg.norm(tangent))
+        if nrm <= 1e-6:
+            return None, None
+
+        tangent /= nrm
+        normal = np.array([-tangent[1], tangent[0]], dtype=np.float32)
+        return tangent, normal
+
+    def _first_boundary_hit_along_ray(self, boundary_mask_u8: np.ndarray, origin_xy, dir_unit_xy, max_steps: int = 5000):
+        """
+        Walk a 1px step ray from origin along dir_unit_xy until it hits boundary_mask_u8 != 0.
+        Returns (x, y) hit point or None.
+        """
+        h, w = boundary_mask_u8.shape[:2]
+        ox, oy = float(origin_xy[0]), float(origin_xy[1])
+        dx, dy = float(dir_unit_xy[0]), float(dir_unit_xy[1])
+
+        x = ox
+        y = oy
+
+        # Skip immediate self-hit by stepping a bit first
+        for _ in range(3):
+            x += dx
+            y += dy
+
+        for _ in range(int(max_steps)):
+            ix = int(round(x))
+            iy = int(round(y))
+            if ix < 0 or iy < 0 or ix >= w or iy >= h:
+                return None
+            if boundary_mask_u8[iy, ix] != 0:
+                return (ix, iy)
+            x += dx
+            y += dy
+
+        return None
+
+    def place_brown_line_at_bottleneck(self, narrowest_pt, boundary_contour, half_length=10):
+        """
+        Draw a brown line spanning between boundary intersections along the local normal.
+
+        Normal mode (default):
+          - ray-trace along +/- normal to find boundary intersections.
+
+        Debug mode (self.debug_brown_line_use_half_length == True):
+          - skip ray tracing and place endpoints at +/- half_length along the local normal.
+
+        Note:
+          - If self.debug_brown_line_rotate_90 is True, uses the TANGENT instead of the normal
+            (i.e., rotates the brown line direction by 90 degrees relative to the prior behavior).
+        """
+        if narrowest_pt is None or boundary_contour is None or len(boundary_contour) < 10:
+            return None, None
+
+        print("[out place_brown_line_at_bottleneck]")
+
+        tangent, normal = self._compute_boundary_tangent_and_normal(boundary_contour, narrowest_pt)
+        if tangent is None or normal is None:
+            return None, None
+
+        # NEW: 90° direction switch (normal <-> tangent)
+        dir_vec = normal
+        if getattr(self, "debug_brown_line_rotate_90", False):
+            dir_vec = tangent
+
+        if getattr(self, "debug_brown_line_use_half_length", False):
+            h, w = self.original_image.shape[:2]
+            ox, oy = float(narrowest_pt[0]), float(narrowest_pt[1])
+
+            half_len = max(1, int(half_length))
+            p1 = (int(round(ox + dir_vec[0] * half_len)), int(round(oy + dir_vec[1] * half_len)))
+            p2 = (int(round(ox - dir_vec[0] * half_len)), int(round(oy - dir_vec[1] * half_len)))
+
+            p1 = (int(np.clip(p1[0], 0, w - 1)), int(np.clip(p1[1], 0, h - 1)))
+            p2 = (int(np.clip(p2[0], 0, w - 1)), int(np.clip(p2[1], 0, h - 1)))
+
+            return p1, p2
+
+        # Rasterize boundary to a 1px mask for robust intersection tests
+        h, w = self.original_image.shape[:2]
+        boundary_mask = np.zeros((h, w), dtype=np.uint8)
+        ctr = boundary_contour.reshape(-1, 1, 2).astype(np.int32)
+        cv2.drawContours(boundary_mask, [ctr], -1, 255, thickness=1)
+
+        # Find first boundary hit on each side of the narrowest point
+        hit_pos = self._first_boundary_hit_along_ray(boundary_mask, narrowest_pt, dir_vec)
+        hit_neg = self._first_boundary_hit_along_ray(boundary_mask, narrowest_pt, -dir_vec)
+
+        if hit_pos is None or hit_neg is None:
+            return None, None
+
+        # Optional: small pad inward so the barrier overlaps the boundary slightly
+        pad_px = 1
+        if pad_px > 0:
+            hit_pos = (int(round(hit_pos[0] - dir_vec[0] * pad_px)), int(round(hit_pos[1] - dir_vec[1] * pad_px)))
+            hit_neg = (int(round(hit_neg[0] + dir_vec[0] * pad_px)), int(round(hit_neg[1] + dir_vec[1] * pad_px)))
+
+        return hit_pos, hit_neg
 
     def flood_fill_and_show_mask_contours_modular(self):
         """
-        Bridging-oriented flood fill with automatic descending kernel sweep,
-        adaptive erosion, and automated brown line placement at leak bottlenecks.
+        Bridging-oriented flood fill with improved recovery from "no valid mask" errors.
+
+        Key improvements:
+        - STRICTER leak detection to prevent massive expansion
+        - Better barrier placement validation
+        - Smarter gap reduction strategy
         """
         # === 0) Guard & seed selection ===
         if self.image is None or not self.seed_points:
@@ -443,201 +567,304 @@ class FloodFillApp(QMainWindow):
             return
         sx, sy = self.seed_points[-1]
 
-        # === Kernel sweep (local, non-destructive to slider) ===
+        # === Configuration ===
         user_gap = max(1, self.pixel_slider['slider'].value())
-        gap_px = user_gap
+        h, w = self.original_image.shape[:2]
 
-        # === 1) Source selection ===
-        flood_source = self.original_image
+        max_outer_iterations = 10
+        min_gap_px = 1
+        perimeter_jump_ratio = 1.25
+        max_auto_barriers_per_iteration = 5
+        max_total_barriers = 15
 
-        # === 2) FloodFill mask w/ border ===
-        h, w = flood_source.shape[:2]
-        base_ff_mask = np.zeros((h + 2, w + 2), np.uint8)
-        base_ff_mask[0, :] = 1; base_ff_mask[-1, :] = 1
-        base_ff_mask[:, 0] = 1; base_ff_mask[:, -1] = 1
+        # Area-based leak detection
+        area_growth_threshold = 1.8
 
-        # === 3) Gap preprocessing (erosion) using swept gap_px ===
-        if gap_px > 1:
-            kernel_gap = np.ones((gap_px, gap_px), np.uint8)
-            prep_img = cv2.erode(flood_source, kernel_gap)
-        else:
-            prep_img = flood_source
+        # NEW: refinement settings after "Success"
+        refine_to_gap_px = 1
+        refine_max_steps = 50  # safety cap on total refinement attempts
+        refine_barriers_budget = 20  # additional barriers allowed in refinement (independent of max_total_barriers)
+        refine_ref_k_extra = 3  # ref mask uses (gap_k + this) to show "pre-leak" region
 
-        # === 4) Barriers (brown lines) ===
-        if self.brown_lines:
-            for pt1, pt2 in self.brown_lines:
-                p1 = (int(pt1[0]) + 1, int(pt1[1]) + 1)
-                p2 = (int(pt2[0]) + 1, int(pt2[1]) + 1)
-                cv2.line(base_ff_mask, p1, p2, color=1, thickness=5)
+        base_aggressiveness = self.aggressiveness_slider['slider'].value()
 
-        # === Helper: single flood with erosion k on a provided source image ===
-        def _flood_with_erode(erode_k: int, src_img: np.ndarray):
-            """
-            Perform a flood fill after eroding src_img with kernel size erode_k.
-            erode_k: erosion kernel size (>=1). If 1, no erosion applied.
-            Returns: (mask_u8, area_pixels)
-            """
-            ff_mask = base_ff_mask.copy()
-            if erode_k > 1:
-                kernel_e = np.ones((erode_k, erode_k), np.uint8)
-                img_for_fill = cv2.erode(src_img, kernel_e, iterations=1)
-            else:
-                img_for_fill = src_img
-
-            aggressiveness = self.aggressiveness_slider['slider'].value()
-            try:
-                cv2.floodFill(
-                    img_for_fill, ff_mask, (int(sx), int(sy)), (255, 255, 255),
-                    (aggressiveness,) * 3, (aggressiveness,) * 3,
-                    flags=cv2.FLOODFILL_MASK_ONLY | cv2.FLOODFILL_FIXED_RANGE
-                )
-            except Exception as ex:
-                print(f"floodFill failed at erosion k={erode_k}: {ex}")
-                return None, 0
-
-            region = ff_mask[1:-1, 1:-1]
-            area = int(np.count_nonzero(region))
-            if area == 0:
-                return None, 0
-            return (region.astype(np.uint8) * 255), area
-
-        # === NEW: Helper functions for leak detection and brown line placement ===
-        def find_narrowest_point(leaked_region, prev_mask):
-            """Find the narrowest constriction (bottleneck) where the leak occurred."""
-            contours, _ = cv2.findContours(prev_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-            if not contours:
-                return None
-            boundary = max(contours, key=cv2.contourArea).reshape(-1, 2)
-        
-            # Distance transform on leaked region (inverted)
-            leaked_inv = cv2.bitwise_not(leaked_region)
-            dist_transform = cv2.distanceTransform(leaked_inv, cv2.DIST_L2, 5)
-        
-            # Find minimum distance along boundary (closest approach to leaked region)
-            min_dist = float('inf')
-            narrowest_pt = None
-            for pt in boundary:
-                d = dist_transform[pt[1], pt[0]]
-                if 0 < d < min_dist:
-                    min_dist = d
-                    narrowest_pt = tuple(pt)
-        
-            return narrowest_pt
-
-        def place_brown_line_at_bottleneck(narrowest_pt, boundary_contour, half_length=50):
-            """Draw a brown line perpendicular to the boundary at the narrowest point."""
-            idx = np.argmin(np.linalg.norm(boundary_contour - np.array(narrowest_pt), axis=1))
-            prev_pt = boundary_contour[(idx - 5) % len(boundary_contour)]
-            next_pt = boundary_contour[(idx + 5) % len(boundary_contour)]
-        
-            # Tangent vector
-            tangent = next_pt - prev_pt
-            tangent_norm = np.linalg.norm(tangent)
-            if tangent_norm == 0:
-                return None, None
-            tangent = tangent / tangent_norm
-        
-            # Normal (perpendicular) vector
-            normal = np.array([-tangent[1], tangent[0]])
-        
-            # Extend line in both directions
-            pt1 = (np.array(narrowest_pt) + half_length * normal).astype(int)
-            pt2 = (np.array(narrowest_pt) - half_length * normal).astype(int)
-        
-            return tuple(pt1), tuple(pt2)
-
-        # === 5) Flood fill with adaptive erosion + automated brown line placement ===
-        start_erode = 1
-        max_erode = max(2, gap_px * 1)
-        area_growth_ratio = 1.4
-        max_auto_barriers = 3  # Limit automated brown lines per seed point
-
+        current_gap_px = user_gap
+        total_barriers_added = 0
         best_mask = None
         best_area = 0
-        starting_mask, starting_area = _flood_with_erode(max_erode, prep_img)
-        if starting_mask is None:
-            print("Flood produced no region (initial erosion).")
-            return
-        best_mask = starting_mask
-        best_area = starting_area
-        prev_mask = starting_mask
-        prev_area = starting_area
-    
-        auto_barriers_added = 0
+        last_valid_mask = None
+        baseline_area = None
 
-        for k in range(max_erode - 1, start_erode - 1, -1):
-            mask_k, area_k = _flood_with_erode(k, flood_source)
-            if mask_k is None:
-                print(f"[Adaptive Erosion] No region at erosion k={k}, using previous k.")
-                break
+        stable_gap_k = None
 
-            # === NEW: Detect leak and place brown line automatically ===
-            if area_k > starting_area * area_growth_ratio and auto_barriers_added < max_auto_barriers:
-                print(f"[Leak Detected at k={k}] Area: {area_k} > {starting_area * area_growth_ratio:.0f}")
-            
-                # Find leak region (XOR difference)
-                leaked_region = cv2.bitwise_xor(prev_mask, mask_k)
-            
-                # Find narrowest point
-                narrowest_pt = find_narrowest_point(leaked_region, prev_mask)
-                if narrowest_pt:
-                    # Get boundary contour
-                    contours, _ = cv2.findContours(prev_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        for outer_iter in range(max_outer_iterations):
+            print(f"\n=== [Outer Iteration {outer_iter + 1}] gap_px={current_gap_px} ===")
+
+            if outer_iter >= 4:
+                temp_aggressiveness = min(255, base_aggressiveness + (outer_iter - 3) * 8)
+                self.aggressiveness_slider['slider'].setValue(temp_aggressiveness)
+                print(f"[Aggressiveness Boost] Temporarily increased to {temp_aggressiveness}")
+
+            optimal_gap_k = self.choose_gap_kernel_descending(
+                start_k=current_gap_px,
+                perimeter_jump_ratio=perimeter_jump_ratio,
+                min_k=1
+            )
+
+            print(f"[choose_gap_kernel_descending] Selected gap_k={optimal_gap_k}")
+
+            mask_at_optimal, ctr_at_optimal = self._compute_flood_mask_with_gap(optimal_gap_k)
+
+            if mask_at_optimal is None:
+                print(f"[Outer {outer_iter + 1}] No region at optimal gap={optimal_gap_k}.")
+
+                if outer_iter < max_outer_iterations - 1:
+                    print("[Recovery] Trying with increased aggressiveness...")
+                    temp_agg = min(255, base_aggressiveness + 20)
+                    self.aggressiveness_slider['slider'].setValue(temp_agg)
+                    mask_at_optimal, ctr_at_optimal = self._compute_flood_mask_with_gap(optimal_gap_k)
+                    self.aggressiveness_slider['slider'].setValue(base_aggressiveness)
+
+                    if mask_at_optimal is not None:
+                        print("[Recovery] Succeeded with higher aggressiveness!")
+                    else:
+                        current_gap_px = max(min_gap_px, current_gap_px - 1)
+                        continue
+                else:
+                    if last_valid_mask is not None:
+                        print("[Fallback] Using last valid mask")
+                        best_mask = last_valid_mask
+                        break
+                    current_gap_px = max(min_gap_px, current_gap_px - 1)
+                    continue
+
+            area_at_optimal = int(np.count_nonzero(mask_at_optimal))
+            last_valid_mask = mask_at_optimal
+
+            if baseline_area is None:
+                baseline_area = area_at_optimal
+                print(f"[Baseline] Established baseline area={baseline_area}")
+
+            min_acceptable_gap = max(2, int(current_gap_px * 0.6))
+            area_is_reasonable = area_at_optimal <= baseline_area * area_growth_threshold
+            gap_is_acceptable = optimal_gap_k >= min_acceptable_gap
+
+            print(f"[Validation] gap_k={optimal_gap_k} >= {min_acceptable_gap}? {gap_is_acceptable}")
+            print(f"[Validation] area={area_at_optimal} <= {baseline_area * area_growth_threshold:.0f}? {area_is_reasonable}")
+
+            barriers_placed_this_iter = 0
+
+            if not area_is_reasonable:
+                print(f"[AREA LEAK] Area grew {area_at_optimal / baseline_area:.1f}x - REJECTING")
+
+                if total_barriers_added < max_total_barriers:
+                    ref_k = max(current_gap_px, optimal_gap_k + 3)
+                    ref_mask, _ = self._compute_flood_mask_with_gap(ref_k)
+
+                    if ref_mask is not None and np.count_nonzero(ref_mask) > 0:
+                        leaked_region = cv2.bitwise_xor(ref_mask, mask_at_optimal)
+
+                        if np.count_nonzero(leaked_region) > baseline_area * 0.1:
+                            for _ in range(max_auto_barriers_per_iteration):
+                                narrowest_pt = self.find_narrowest_point(leaked_region, ref_mask)
+                                if not narrowest_pt:
+                                    break
+
+                                contours, _ = cv2.findContours(ref_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+                                if not contours:
+                                    break
+                                boundary = max(contours, key=cv2.contourArea).reshape(-1, 2)
+
+                                pt1, pt2 = self.place_brown_line_at_bottleneck(narrowest_pt, boundary)
+                                if pt1 is None or pt2 is None:
+                                    break
+
+                                self.brown_lines.append((pt1, pt2))
+                                total_barriers_added += 1
+                                barriers_placed_this_iter += 1
+                                print(f"[Auto Barrier {total_barriers_added}] Placed at {narrowest_pt}")
+
+                                test_mask, _ = self._compute_flood_mask_with_gap(optimal_gap_k)
+                                test_area = int(np.count_nonzero(test_mask)) if test_mask is not None else 0
+
+                                if test_mask is not None and test_area <= baseline_area * area_growth_threshold:
+                                    mask_at_optimal = test_mask
+                                    area_at_optimal = test_area
+                                    area_is_reasonable = True
+                                    print(f"[Barrier Effective] Area reduced to {area_at_optimal}")
+                                    break
+
+                                if test_mask is None:
+                                    break
+                                leaked_region = cv2.bitwise_xor(ref_mask, test_mask)
+
+                if barriers_placed_this_iter > 0 and area_is_reasonable:
+                    print(f"[Recovery] {barriers_placed_this_iter} barriers placed, continuing at gap_px={current_gap_px}")
+                    continue
+
+                current_gap_px = max(min_gap_px, current_gap_px - 2)
+                print(f"[Gap Reduction] Reducing to gap_px={current_gap_px}")
+                continue
+
+            if not gap_is_acceptable:
+                print(f"[LOW GAP] gap_k={optimal_gap_k} < {min_acceptable_gap}")
+
+                if area_at_optimal < 500 or total_barriers_added >= max_total_barriers:
+                    print("[Accepting Anyway] Small area or barrier limit reached")
+                    best_mask = mask_at_optimal
+                    best_area = area_at_optimal
+                    break
+
+                current_gap_px = max(min_gap_px, current_gap_px - 1)
+                continue
+
+            best_mask = mask_at_optimal
+            best_area = area_at_optimal
+            stable_gap_k = optimal_gap_k
+            print(f"\n=== [Success] Stable boundary at gap_px={optimal_gap_k}, area={best_area} ===")
+            break
+
+        # NEW: refinement pass – try to drive gap toward 1 using brown lines to stop leaks
+        if best_mask is not None and stable_gap_k is not None and stable_gap_k > refine_to_gap_px:
+            print(f"\n=== [Refine] Attempting to reduce gap from {stable_gap_k} to {refine_to_gap_px} using brown-line bottlenecks ===")
+
+            refine_steps = 0
+            refine_barriers_added = 0
+
+            # Keep the last known-good region as the invariant reference
+            accepted_gap = int(stable_gap_k)
+            accepted_mask = best_mask.copy()
+            accepted_area = int(np.count_nonzero(accepted_mask))
+
+            while accepted_gap > refine_to_gap_px and refine_steps < refine_max_steps:
+                refine_steps += 1
+                target_gap = max(refine_to_gap_px, accepted_gap - 1)
+
+                test_mask, _ = self._compute_flood_mask_with_gap(target_gap)
+                if test_mask is None:
+                    print(f"[Refine] No region at target_gap={target_gap}. Stopping refine.")
+                    break
+
+                test_area = int(np.count_nonzero(test_mask))
+
+                # Leak check is relative to ACCEPTED mask (not a moving ref_k)
+                leak_limit_area = int(accepted_area * area_growth_threshold)
+
+                if test_area <= leak_limit_area:
+                    # Accept tighter gap immediately
+                    best_mask = test_mask
+                    best_area = test_area
+                    stable_gap_k = target_gap
+
+                    accepted_gap = target_gap
+                    accepted_mask = test_mask.copy()
+                    accepted_area = test_area
+
+                    print(f"[Refine] Accepted target_gap={target_gap} area={test_area} (limit={leak_limit_area})")
+                    continue
+
+                # Leak at tighter gap: compute JUST the new area (test \ accepted)
+                leaked_region = cv2.bitwise_and(test_mask, cv2.bitwise_not(accepted_mask))
+                leaked_area = int(np.count_nonzero(leaked_region))
+
+                print(f"[Refine] Leak at target_gap={target_gap}: test_area={test_area}, accepted_area={accepted_area}, leaked_area={leaked_area}")
+
+                if refine_barriers_added >= refine_barriers_budget:
+                    print("[Refine] Barrier budget reached. Stopping refine.")
+                    break
+
+                if leaked_area <= max(50, int(accepted_area * 0.01)):
+                    print("[Refine] Leak region too small/ambiguous; stopping refine.")
+                    break
+
+                # Try multiple barriers at this SAME target_gap until it becomes acceptable
+                barriers_this_gap = 0
+                while refine_barriers_added < refine_barriers_budget and barriers_this_gap < max_auto_barriers_per_iteration:
+                    # Narrowest point should be found relative to the accepted boundary
+                    narrowest_pt = self.find_narrowest_point(leaked_region, accepted_mask)
+                    if not narrowest_pt:
+                        print("[Refine] No narrowest point found; stopping refine.")
+                        break
+
+                    contours, _ = cv2.findContours(accepted_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+                    if not contours:
+                        print("[Refine] No contours on accepted_mask; stopping refine.")
+                        break
+
                     boundary = max(contours, key=cv2.contourArea).reshape(-1, 2)
-                
-                    # Place brown line
-                    pt1, pt2 = place_brown_line_at_bottleneck(narrowest_pt, boundary, half_length=gap_px * 8)
-                    if pt1 is not None and pt2 is not None:
-                        self.brown_lines.append((pt1, pt2))
-                        print(f"[Auto Brown Line] Added at narrowest point: {pt1} → {pt2}")
-                    
-                        # Update base_ff_mask with new barrier
-                        cv2.line(base_ff_mask, 
-                                 (int(pt1[0]) + 1, int(pt1[1]) + 1), 
-                                 (int(pt2[0]) + 1, int(pt2[1]) + 1), 
-                                 color=1, thickness=5)
-                    
-                        auto_barriers_added += 1
-                    
-                        # Retry flood fill at current k with new barrier
-                        mask_k, area_k = _flood_with_erode(k, flood_source)
-                        if mask_k is None:
-                            break
-                    
-                        # Check if leak is fixed
-                        if area_k <= starting_area * area_growth_ratio:
-                            print(f"[Leak Fixed] Continuing with k={k}")
-                            prev_mask = mask_k
-                            prev_area = area_k
-                            best_mask = mask_k
-                            best_area = area_k
-                            continue
-            
-                # If leak persists or no narrowest point found, revert
-                print(f"[Leak Persists] Reverting to k={k+1}")
-                best_mask = prev_mask
-                best_area = prev_area
-                break
 
-            prev_mask = mask_k
-            prev_area = area_k
-            best_mask = mask_k
-            best_area = area_k
+                    pt1, pt2 = self.place_brown_line_at_bottleneck(narrowest_pt, boundary)
+                    if pt1 is None or pt2 is None:
+                        print("[Refine] Failed to place brown line at bottleneck; stopping refine.")
+                        break
 
-            if k == start_erode:
-                print(f"[Adaptive Erosion] Reached minimal erosion k={k} without excessive expansion. Using this mask (area={area_k}).")
+                    self.brown_lines.append((pt1, pt2))
+                    refine_barriers_added += 1
+                    barriers_this_gap += 1
+                    print(f"[Refine Barrier {refine_barriers_added}] Added {pt1} -> {pt2} at {narrowest_pt} for target_gap={target_gap}")
+
+                    # Recompute at SAME target_gap after adding barrier
+                    retry_mask, _ = self._compute_flood_mask_with_gap(target_gap)
+                    if retry_mask is None:
+                        print(f"[Refine] Retry failed at target_gap={target_gap}; stopping refine.")
+                        break
+
+                    retry_area = int(np.count_nonzero(retry_mask))
+                    if retry_area <= leak_limit_area:
+                        # Barrier fixed it; accept tighter gap
+                        best_mask = retry_mask
+                        best_area = retry_area
+                        stable_gap_k = target_gap
+
+                        accepted_gap = target_gap
+                        accepted_mask = retry_mask.copy()
+                        accepted_area = retry_area
+
+                        print(f"[Refine] Leak fixed; accepted target_gap={target_gap} area={retry_area} (limit={leak_limit_area})")
+                        break
+
+                    leaked_region = cv2.bitwise_and(retry_mask, cv2.bitwise_not(accepted_mask))
+                    leaked_area = int(np.count_nonzero(leaked_region))
+                    print(f"[Refine] Still leaking at target_gap={target_gap}: retry_area={retry_area}, leaked_area={leaked_area}")
+
+                # If we didn't accept this target_gap, stop refinement (or keep trying is possible, but this matches your spec)
+                if accepted_gap != target_gap:
+                    print(f"[Refine] Could not stabilize target_gap={target_gap}; stopping refine.")
+                    break
+
+            total_barriers_added += refine_barriers_added
+            print(f"=== [Refine] Done. Final gap_k={stable_gap_k}, area={best_area}, refine barriers={refine_barriers_added} ===")
+
+        if best_mask is None:
+            if last_valid_mask is not None:
+                print("[Ultimate Fallback] Using last valid mask from iterations")
+                best_mask = last_valid_mask
+                best_area = int(np.count_nonzero(last_valid_mask))
+            else:
+                print("[Desperate Recovery] Attempting gap=1 with max aggressiveness...")
+                self.aggressiveness_slider['slider'].setValue(min(255, base_aggressiveness + 50))
+                best_mask, _ = self._compute_flood_mask_with_gap(1)
+                self.aggressiveness_slider['slider'].setValue(base_aggressiveness)
+
+                if best_mask is None:
+                    print("[Error] No valid mask found after all recovery attempts")
+                    return
+
+                best_area = int(np.count_nonzero(best_mask))
+                print(f"[Desperate Success] Found mask with area={best_area}")
 
         new_region_u8 = best_mask
-        print(f"[Adaptive Erosion] Selected flood area={best_area} pixels (baseline={starting_area}). Auto barriers added: {auto_barriers_added}")
+        print(f"\n[Final] area={best_area} pixels, total barriers={total_barriers_added}")
 
-        # Prepare / validate age map
+        self.aggressiveness_slider['slider'].setValue(base_aggressiveness)
+
+        # (rest of your existing integration/cleanup/render code remains unchanged)
         if getattr(self, 'mask_age', None) is None or (self.mask is not None and self.mask_age.shape != self.mask.shape):
             base_shape = new_region_u8.shape if self.mask is None else self.mask.shape
             self.mask_age = np.zeros(base_shape, dtype=np.uint16)
 
         existing_before = np.zeros_like(new_region_u8, dtype=bool) if self.mask is None else (self.mask > 0)
 
-        # === 6) Integrate with existing mask (bridging logic) ===
         if self.mask is None:
             addition = new_region_u8
             self.mask_age[addition > 0] = 0
@@ -655,7 +882,7 @@ class FloodFillApp(QMainWindow):
                 new_pixels = cv2.bitwise_and(new_region_u8, cv2.bitwise_not(self.mask))
 
                 if cv2.countNonZero(new_pixels) > 0:
-                    geodesic_iters = gap_px * 3
+                    geodesic_iters = current_gap_px * 3
                     candidate_region = cv2.bitwise_or(comp_mask, new_pixels)
                     geodesic_allowed = self.geodesic_limit_dilation(
                         comp_mask, candidate_region, max_iters=geodesic_iters, se_size=3
@@ -665,7 +892,7 @@ class FloodFillApp(QMainWindow):
                     if cv2.countNonZero(others_mask) > 0:
                         others_inv = np.where(others_mask == 0, 255, 0).astype(np.uint8)
                         dt = cv2.distanceTransform(others_inv, cv2.DIST_L2, 3)
-                        bridge_radius_px = gap_px * 4
+                        bridge_radius_px = current_gap_px * 4
                         near_others = (dt <= bridge_radius_px).astype(np.uint8) * 255
                         bridge_allowed = cv2.bitwise_and(geodesic_new_only, near_others)
                     else:
@@ -688,25 +915,7 @@ class FloodFillApp(QMainWindow):
             self.mask_age[addition > 0] = 0
             self.mask = cv2.bitwise_or(self.mask, addition)
 
-        # === Continue with existing bridge_outer_boundary_over_text and cleanup ===
-        self.bridge_outer_boundary_over_text(
-            gap_px, 
-            dilate_strip_iters=12, 
-            ransac_residual=1.5, 
-            min_line_len_px=40, 
-            band_thick=14, 
-            guide_thick=16, 
-            close_iters=2, 
-            finalize_max_dev_px=20,
-            enable_gap_bridging=True,
-            parallel_angle_tol_deg=10.0,
-            max_gap_distance=None,
-            bridge_line_thick=1,
-            min_sample_line_len_px=40
-        )
-
-        # === 7) Local cleanup (closing) ===
-        base = max(1, gap_px)
+        base = max(1, current_gap_px)
         local_radius = int(np.clip(base, 2, 12))
         se_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * local_radius + 1, 2 * local_radius + 1))
         pre_close_mask = (self.mask > 0)
@@ -714,7 +923,6 @@ class FloodFillApp(QMainWindow):
         envelope = cv2.dilate(self.mask, se_close, iterations=1)
         self.mask = cv2.bitwise_and(closed, envelope)
 
-        # 7f) Protect around barriers (brown lines)
         if self.brown_lines:
             protect = np.zeros_like(self.mask, dtype=np.uint8)
             for pt1, pt2 in self.brown_lines:
@@ -723,7 +931,6 @@ class FloodFillApp(QMainWindow):
             protect = cv2.dilate(protect, se_close, iterations=1)
             self.mask[protect > 0] = self.mask[protect > 0] & pre_close_mask[protect > 0]
 
-        # 7g) Age tracking
         post_mask = (self.mask > 0)
         closed_added = post_mask & (~pre_close_mask)
         if np.any(closed_added):
@@ -732,7 +939,6 @@ class FloodFillApp(QMainWindow):
         if np.any(removed):
             self.mask_age[removed] = 0
 
-        # === 8) Overlay rendering ===
         overlay = self.original_image.copy()
         age_step = 20
         min_red = 40
@@ -746,18 +952,26 @@ class FloodFillApp(QMainWindow):
             overlay[..., 2][mask_bool] = red_map[mask_bool]
         blended = cv2.addWeighted(self.original_image, 0.7, overlay, 0.3, 0)
 
-        # === 9) Debug save ===
-        try:
-            base_dir = os.path.dirname(os.path.abspath(__file__))
-            out_dir = os.path.join(base_dir, "blend_debug_output")
-            os.makedirs(out_dir, exist_ok=True)
-            cv2.imwrite(os.path.join(out_dir, "blended_latest.png"), blended)
-        except Exception as e:
-            print(f"Failed to save blended overlay: {e}")
-
-        # === 10) UI update ===
         self.image = blended
         self.update_canvas_image()
+
+    def geodesic_limit_dilation(self, marker, mask, max_iters=10, se_size=3):
+        """
+        Geodesic dilation: expand marker within mask boundary.
+        marker: starting region (uint8, 0/255)
+        mask: allowed region (uint8, 0/255)
+        max_iters: maximum dilation iterations
+        se_size: structuring element size
+        """
+        se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (se_size, se_size))
+        current = marker.copy()
+        for _ in range(max_iters):
+            dilated = cv2.dilate(current, se, iterations=1)
+            new_current = cv2.bitwise_and(dilated, mask)
+            if np.array_equal(new_current, current):
+                break
+            current = new_current
+        return current
 
     def zoom(self, delta):
         if self.image is None:
@@ -1053,7 +1267,6 @@ class FloodFillApp(QMainWindow):
         self.debug_bridge_connectors = []
         self.bridged_regions_mask = None  # NEW: Reset bridged regions
         self.update_canvas_image()
-
 
     def fit_to_view(self):
         if self.image is None:
@@ -2276,7 +2489,6 @@ class FloodFillApp(QMainWindow):
             return
 
         start_k = max(1, int(self.pixel_slider['slider'].value()))
-        # Decrease kernel down to 1
         k_values = list(range(start_k, 0, -1))
 
         last_peri = None
@@ -2285,7 +2497,6 @@ class FloodFillApp(QMainWindow):
         for k in k_values:
             mask_k, ctr_k = self._compute_flood_mask_with_gap(k)
             if mask_k is None or ctr_k is None:
-                # No region at this k; if we already had something, stop here
                 if last_good is not None:
                     break
                 else:
@@ -2294,15 +2505,12 @@ class FloodFillApp(QMainWindow):
             area_k, peri_k = self._contour_area_perimeter(ctr_k)
 
             if last_peri is not None:
-                # Leak condition: perimeter grows > 20% versus previous step
                 if peri_k > last_peri * 1.20:
-                    # Stop at first perimeter jump; use last_good
                     break
 
             last_good = (k, mask_k, ctr_k, area_k, peri_k)
             last_peri = peri_k
 
-        # If we never tripped the perimeter growth condition, pick the final evaluated (k=1) result
         chosen = last_good
         if chosen is None:
             self.statusBar().showMessage("Kernel sweep found no valid flood region.")
@@ -2310,19 +2518,14 @@ class FloodFillApp(QMainWindow):
 
         chosen_k, chosen_mask_u8, chosen_ctr, area_c, peri_c = chosen
 
-        # Apply selected mask
         self.mask = chosen_mask_u8.copy()
         self.mask_age = np.zeros_like(self.mask, dtype=np.uint16)
 
-        # Reflect chosen kernel in the Gap Pixels slider
         self.pixel_slider['slider'].setValue(int(chosen_k))
         self.pixel_slider['value_label'].setText(str(int(chosen_k)))
 
-        # Update decimated outer contour for display
-        # Simplify a bit for viewing
         eps = max(1.0, 0.01 * cv2.arcLength(chosen_ctr, True))
         approx = cv2.approxPolyDP(chosen_ctr, eps, True)
-        # Ensure closed
         if not np.array_equal(approx[0][0], approx[-1][0]):
             approx = np.vstack([approx, [approx[0]]])
         self.decimated_contour = approx
@@ -2899,57 +3102,6 @@ class FloodFillApp(QMainWindow):
 
         self.debug_detected_boundary_lines = [(p1, p2) for p1, p2, _, _ in detected_lines]
         self.debug_bridge_connectors = bridge_lines.copy() if bridge_lines else []
-
-    def find_narrowest_point(leaked_region, prev_mask):
-        """
-        Find the narrowest constriction (bottleneck) where the leak occurred.
-        Returns: (x, y) tuple of the narrowest point on the boundary.
-        """
-        # Get boundary of the pre-leak mask
-        contours, _ = cv2.findContours(prev_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-        if not contours:
-            return None
-        boundary = max(contours, key=cv2.contourArea).reshape(-1, 2)
-    
-        # Distance transform on leaked region (inverted)
-        leaked_inv = cv2.bitwise_not(leaked_region)
-        dist_transform = cv2.distanceTransform(leaked_inv, cv2.DIST_L2, 5)
-    
-        # Find minimum distance along boundary (closest approach to leaked region)
-        min_dist = float('inf')
-        narrowest_pt = None
-        for pt in boundary:
-            d = dist_transform[pt[1], pt[0]]  # distance from boundary to leaked region
-            if 0 < d < min_dist:
-                min_dist = d
-                narrowest_pt = tuple(pt)
-    
-        return narrowest_pt
-
-    def place_brown_line_at_bottleneck(narrowest_pt, boundary_contour, thickness=10):
-        """
-        Draw a brown line perpendicular to the boundary at the narrowest point.
-        Returns: (pt1, pt2) tuple for the brown line.
-        """
-        # Find normal direction at narrowest_pt
-        idx = np.argmin(np.linalg.norm(boundary_contour - np.array(narrowest_pt), axis=1))
-        prev_pt = boundary_contour[(idx - 5) % len(boundary_contour)]
-        next_pt = boundary_contour[(idx + 5) % len(boundary_contour)]
-    
-        # Tangent vector
-        tangent = next_pt - prev_pt
-        tangent = tangent / np.linalg.norm(tangent)
-    
-        # Normal (perpendicular) vector
-        normal = np.array([-tangent[1], tangent[0]])
-    
-        # Extend line in both directions
-        half_length = 50  # pixels (tune based on gap_px)
-        pt1 = (narrowest_pt + half_length * normal).astype(int)
-        pt2 = (narrowest_pt - half_length * normal).astype(int)
-    
-        return tuple(pt1), tuple(pt2)
-
 
 
 
